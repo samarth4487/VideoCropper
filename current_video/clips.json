@@ -1,0 +1,21 @@
+{
+  "clips": [
+    {
+      "name": "01_clean_racing",
+      "start": "00:29:57.000",
+      "end": "00:30:03.000",
+      "texts": [
+        {
+          "text": "Clean racing hits different in racing games",
+          "start": "00:00:00.000",
+          "end": "00:00:03.000",
+          "color": "white",
+          "word_colors": [
+            { "word_index": 2, "color": "green" },
+            { "word_index": 6, "color": "yellow" }
+          ]
+        }
+      ]
+    }
+  ]
+}

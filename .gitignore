@@ -1,0 +1,13 @@
+# macOS and Python-generated files
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# The current-video workspace is disposable. Keep the editable configuration
+# and the empty output-folder marker, but never version active source footage
+# or rendered clips.
+current_video/*
+!current_video/clips.json
+!current_video/outputs/
+current_video/outputs/*
+!current_video/outputs/.gitkeep
