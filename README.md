@@ -65,8 +65,22 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
 
 - With only `text`, the caption starts at the clip's first frame and remains visible through its last frame.
 - To customize timing, use a text-relative `start` with either `end` or `duration`. Text timestamps are relative to the start of that clip, not the source video.
-- `color` defaults to `white`. Presets are `white`, `red`, `green`, and `yellow`; any `#RRGGBB` color and stable `random` are accepted.
 - Use one-based `word_index` values in `word_colors` to color selected words independently, including repeated words.
+
+### Color reference
+
+`color` defaults to `white`. These are the only accepted named colors:
+
+| Value to put in JSON | Rendered color | Exact hex value |
+| --- | --- | --- |
+| `white` | White | `#FFFFFF` |
+| `red` | Red | `#FF3B30` |
+| `green` | Green | `#34C759` |
+| `yellow` | Yellow | `#FFD60A` |
+
+For any other exact color, use a six-digit hex value in `#RRGGBB` form. For example, the orange used in example 5 is explicitly `#FF8A00`; the word `orange` is **not** accepted as a color name. Invalid names or malformed hex values fail validation before rendering.
+
+`random` is an optional special value requested for automatic color selection. It calculates one bright hex color from the clip/text/word data and keeps that same result on re-renders of the same configuration. It does **not** choose a new color for every frame or every render. Use a named preset or a specific hex value whenever you want an exact predictable color.
 
 ## Configuration examples
 
@@ -182,7 +196,7 @@ Run example 5 with the three commands in [How to use the tool](#how-to-use-the-t
 
 Run example 6 with the three commands in [How to use the tool](#how-to-use-the-tool). Its caption appears at clip time two seconds and disappears after three seconds.
 
-### 7. Use a stable automatic color
+### 7. Use a stable automatic color (`random`)
 
 ```json
 {
@@ -199,7 +213,7 @@ Run example 6 with the three commands in [How to use the tool](#how-to-use-the-t
 }
 ```
 
-Run example 7 with the three commands in [How to use the tool](#how-to-use-the-tool). `random` remains the same for that caption when the clip is rendered again.
+Run example 7 with the three commands in [How to use the tool](#how-to-use-the-tool). `random` calculates one stable bright color for this exact caption; use a named preset or hex value instead when you need an exact color.
 
 ## Commands
 
