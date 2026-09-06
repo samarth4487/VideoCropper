@@ -37,6 +37,28 @@ Each clip needs a unique `name`, a `start`, and exactly one of `end` or `duratio
 
 When working through Codex, each new request that supplies clip timings replaces the entire `clips` list for the active video. Old entries are never appended or carried into a new request, so stale instructions from a video you already deleted cannot be rendered accidentally.
 
+## How to use the tool
+
+1. Put exactly one supported landscape video directly in `current_video/`.
+2. Replace the entire contents of `current_video/clips.json` with one of the examples below, changing its times and text as needed.
+3. From the `Video Cropper` folder, run these commands in order:
+
+```bash
+python3 video_cropper.py validate
+```
+
+```bash
+python3 video_cropper.py dry-run
+```
+
+```bash
+python3 video_cropper.py render
+```
+
+`validate` checks the source and configuration. `dry-run` prints the FFmpeg plan without creating files. `render` writes the requested MP4 files to `current_video/outputs/`. The default render is sequential: one clip at a time. Use `python3 video_cropper.py render --jobs 2` or `--jobs 3` only when you want parallel encodes. If an output with the same filename already exists, review it first; use `python3 video_cropper.py render --overwrite` only when you intend to replace it.
+
+The commands are identical for every example; the JSON in `clips.json` is what chooses the clip timings, text, and colors.
+
 ### Optional on-screen text
 
 Text is optional: omit `texts` to render gameplay only. When present, each item has a required `text`; all other text timing fields are optional. Text is top-centred, uses the fixed display treatment, respects the 120-pixel left/right safe area, wraps automatically to at most four lines, and appears/disappears without animation.
@@ -58,6 +80,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
 }
 ```
 
+Run example 1 with the three commands in [How to use the tool](#how-to-use-the-tool). It creates `current_video/outputs/01_intro.mp4` with gameplay only.
+
 ### 2. Use a clip duration instead of an end time
 
 ```json
@@ -67,6 +91,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
   ]
 }
 ```
+
+Run example 2 with the three commands in [How to use the tool](#how-to-use-the-tool). It creates a 20-second `02_jump.mp4`.
 
 ### 3. Add default white text for the full clip
 
@@ -85,6 +111,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
 }
 ```
 
+Run example 3 with the three commands in [How to use the tool](#how-to-use-the-tool). The white caption is visible from the first to the final frame of `03_full_caption.mp4`.
+
 ### 4. Set one color for the full caption
 
 ```json
@@ -101,6 +129,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
   ]
 }
 ```
+
+Run example 4 with the three commands in [How to use the tool](#how-to-use-the-tool). The full caption in `04_green_caption.mp4` uses the `green` preset.
 
 ### 5. Color particular words with presets or hex values
 
@@ -126,6 +156,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
 }
 ```
 
+Run example 5 with the three commands in [How to use the tool](#how-to-use-the-tool). The word indexes are counted from left to right, starting at 1.
+
 ### 6. Show text for only part of the clip
 
 ```json
@@ -148,6 +180,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
 }
 ```
 
+Run example 6 with the three commands in [How to use the tool](#how-to-use-the-tool). Its caption appears at clip time two seconds and disappears after three seconds.
+
 ### 7. Use a stable automatic color
 
 ```json
@@ -164,6 +198,8 @@ Text is optional: omit `texts` to render gameplay only. When present, each item 
   ]
 }
 ```
+
+Run example 7 with the three commands in [How to use the tool](#how-to-use-the-tool). `random` remains the same for that caption when the clip is rendered again.
 
 ## Commands
 
