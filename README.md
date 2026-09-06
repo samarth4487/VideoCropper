@@ -189,6 +189,8 @@ Run the small built-in automated verification with:
 python3 video_cropper.py self-test
 ```
 
+`self-test` is safe to run without an active source video. It checks that both `ffmpeg` and `ffprobe` are installed and runnable, validates timestamp/name/source-discovery rules, checks start/end and start/duration configuration, text defaults and custom timings, preset/hex/random word colors, four-line safe-area limits, and the ten-second seek rule. It also creates a tiny temporary video, renders a captioned clip, and verifies its H.264/AAC streams, dimensions, frame rate, BT.709 tags, zero timestamps, duration, and MP4 faststart layout with `ffprobe`. No files in `current_video/` are changed.
+
 ## Render specification
 
 Every output is rendered (never stream-copied) with frame-accurate video and audio trimming starting at timestamp zero. It is exactly 1440×2560 at 60 fps, H.264 High / CRF 18 / 8-bit `yuv420p`, AAC 48 kHz stereo at 192 kbps, MP4 faststart, and SDR BT.709 metadata. Source gameplay audio is only trimmed and re-encoded as required—no narration, music, effects, muting, gain changes, or mixing.

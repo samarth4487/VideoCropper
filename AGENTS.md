@@ -62,7 +62,7 @@ Text is optional; omit `texts` for a gameplay-only clip. When the user requests 
 
 ## Testing and cleanup
 
-- For a code/configuration check without a source video, run `python3 video_cropper.py self-test`.
+- For a code/configuration check without a source video, run `python3 video_cropper.py self-test`. It verifies FFmpeg/FFprobe availability and runs a temporary end-to-end render; it never changes `current_video/`.
 - `python3 video_cropper.py validate` is the required pre-render check once a source is present.
 - `python3 video_cropper.py clear --yes` is destructive: it removes supported top-level source videos, `clips.json`, and `outputs/`, then recreates `outputs/`. Run it only when the user explicitly asks to reset/clear the active video workspace.
 - Do not delete a user's source, clips, or outputs by any other means.

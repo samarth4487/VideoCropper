@@ -692,9 +692,127 @@ class CropperUnitTests(unittest.TestCase):
         self.assertIn("&H000AD6FF&", ass)  # #FFD60A in ASS BGR order.
         self.assertEqual(resolve_color("random", "same-seed"), resolve_color("random", "same-seed"))
 
+    def test_text_timing_presets_hex_and_random(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "clips.json"
+            config.write_text(
+                json.dumps({"clips": [{
+                    "name": "custom_text",
+                    "start": "00:00",
+                    "duration": "00:10",
+                    "texts": [{
+                        "text": "One two three four",
+                        "start": "00:02",
+                        "duration": "00:03",
+                        "color": "red",
+                        "word_colors": [
+                            {"word_index": 2, "color": "#12abEF"},
+                            {"word_index": 4, "color": "random"},
+                        ],
+                    }],
+                }]}),
+                encoding="utf-8",
+            )
+            text = load_clips(config, Decimal("20"))[0].texts[0]
+        self.assertEqual((text.start, text.end), (Decimal("2"), Decimal("5")))
+        self.assertEqual(text.color, "#FF3B30")
+        self.assertEqual(text.word_colors, ((2, "#12ABEF"), (4, "random")))
+        self.assertEqual(parse_color("white", "test"), "#FFFFFF")
+        self.assertEqual(parse_color("yellow", "test"), "#FFD60A")
+
+    def test_four_line_safe_area_and_overflow_rejection(self) -> None:
+        four_lines = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron"
+        self.assertEqual(len(wrap_words(four_lines.split())), 4)
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "clips.json"
+            config.write_text(
+                json.dumps({"clips": [{
+                    "name": "too_long",
+                    "start": "00:00",
+                    "duration": "00:10",
+                    "texts": [{"text": four_lines + " pi rho sigma tau upsilon"}],
+                }]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(CropperError):
+                load_clips(config, Decimal("20"))
+
+
+class CropperRuntimeTests(unittest.TestCase):
+    def test_required_tools_are_installed_and_runnable(self) -> None:
+        require_binaries()
+        for executable in ("ffmpeg", "ffprobe"):
+            result = subprocess.run(
+                [executable, "-version"], text=True, capture_output=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(executable, result.stdout.lower())
+
+    def test_end_to_end_render_with_text_and_audio(self) -> None:
+        """Render a tiny disposable source and inspect the completed MP4."""
+        with tempfile.TemporaryDirectory(prefix="video-cropper-self-test-") as temp:
+            folder = Path(temp)
+            source_path = folder / "source.mp4"
+            generated = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=60",
+                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                    "-t", "0.25", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(source_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            source = run_ffprobe(source_path)
+            clip = Clip(
+                "smoke",
+                Decimal(0),
+                Decimal("0.2"),
+                (TextOverlay("Clean racing", Decimal(0), Decimal("0.2"), "#FFFFFF", ((2, "#34C759"),)),),
+            )
+            subtitles = folder / "caption.ass"
+            subtitles.write_text(make_ass(clip), encoding="utf-8")
+            destination = folder / "rendered.mp4"
+            rendered = subprocess.run(
+                build_ffmpeg_command(source, clip, destination, subtitles),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            inspected = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries",
+                    "format=duration,start_time:stream=codec_type,codec_name,profile,width,height,pix_fmt,"
+                    "r_frame_rate,sample_rate,channels,start_time,color_space,color_transfer,color_primaries",
+                    "-of", "json", str(destination),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(inspected.returncode, 0, inspected.stderr)
+            payload = json.loads(inspected.stdout)
+            streams = {stream["codec_type"]: stream for stream in payload["streams"]}
+            video, audio = streams["video"], streams["audio"]
+            self.assertEqual((video["codec_name"], video["profile"]), ("h264", "High"))
+            self.assertEqual((video["width"], video["height"], video["pix_fmt"]), (1440, 2560, "yuv420p"))
+            self.assertEqual(video["r_frame_rate"], "60/1")
+            self.assertEqual((video["color_space"], video["color_transfer"], video["color_primaries"]), ("bt709", "bt709", "bt709"))
+            self.assertEqual((audio["codec_name"], audio["sample_rate"], audio["channels"]), ("aac", "48000", 2))
+            self.assertEqual((video["start_time"], audio["start_time"]), ("0.000000", "0.000000"))
+            self.assertGreaterEqual(Decimal(payload["format"]["duration"]), Decimal("0.19"))
+            self.assertLessEqual(Decimal(payload["format"]["duration"]), Decimal("0.25"))
+            data = destination.read_bytes()
+            self.assertLess(data.index(b"moov"), data.index(b"mdat"))
+
 
 def command_self_test(_: argparse.Namespace) -> int:
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(CropperUnitTests)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
