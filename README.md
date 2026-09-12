@@ -20,6 +20,19 @@ Put one `.mp4`, `.mov`, `.m4v`, or `.mkv` directly in `current_video/`. The tool
 
 When switching videos, run `python3 video_cropper.py clear --yes`, then put the next video and its new `clips.json` in `current_video/`. `clear` removes only supported top-level source video files, `clips.json`, and `outputs/`; it recreates an empty `outputs/` folder and leaves unrelated files alone.
 
+## Output modes
+
+Each clip has a `mode` field. Video Cropper supports exactly these two values:
+
+| Mode | When to use it | Result |
+| --- | --- | --- |
+| `vertical` | Vertical social-media clips | The default. It creates the existing 1440×2560, 9:16 blurred-background layout. Optional `texts` overlays are supported. |
+| `original` | A simple landscape source-format cut | It trims only the requested time range. There is no scale, crop, blur, forced frame rate, text, or other visual treatment. |
+
+`mode` belongs inside each clip object. If it is omitted, the clip uses `"vertical"`. Clips in the same `clips` array may use different modes. Any value other than `"vertical"` or `"original"` fails validation.
+
+`original` mode is for the same landscape 16:9 SDR source accepted by this utility. It preserves that source's frame dimensions and frame rate, including 2560×1440 (2K) sources. It still re-encodes the exact range into MP4 so the clip starts and ends on the requested frames; it is not a keyframe-limited stream copy. `texts` is not allowed in `original` mode, including an empty `texts` array.
+
 ## Clip configuration
 
 Edit [`current_video/clips.json`](current_video/clips.json):
@@ -33,31 +46,14 @@ Edit [`current_video/clips.json`](current_video/clips.json):
 }
 ```
 
-Each clip needs a unique `name`, a `start`, and exactly one of `end` or `duration`. Timestamps support `HH:MM:SS`, `MM:SS`, and optional milliseconds. Every range is validated before any render: its end must follow its start and fall within the source duration. Names are converted to safe filenames; collisions after sanitization are rejected. The rendered filename is `<safe-name>.mp4`.
-
-`mode` is optional. It defaults to `"vertical"`, which is the existing 9:16 blurred-background layout. Set `"mode": "original"` for a plain 16:9 cut: the source is only trimmed to the requested timestamps, with no crop, scale, blur, forced frame rate, text, or other visual treatment. Its output keeps the source's frame dimensions and frame rate. The exact trim is re-encoded into MP4 so the clip starts and ends on the requested frames; it is not a keyframe-limited stream copy.
-
-For example, this makes an unadorned 16:9 clip:
-
-```json
-{
-  "clips": [
-    {
-      "name": "race_finish",
-      "start": "00:01:20.000",
-      "end": "00:01:35.000",
-      "mode": "original"
-    }
-  ]
-}
-```
+Each clip needs a unique `name`, a `start`, exactly one of `end` or `duration`, and an optional `mode`. Timestamps support `HH:MM:SS`, `MM:SS`, and optional milliseconds. Every range is validated before any render: its end must follow its start and fall within the source duration. Names are converted to safe filenames; collisions after sanitization are rejected. The rendered filename is `<safe-name>.mp4`.
 
 When working through Codex, each new request that supplies clip timings replaces the entire `clips` list for the active video. Old entries are never appended or carried into a new request, so stale instructions from a video you already deleted cannot be rendered accidentally.
 
 ## How to use the tool
 
 1. Put exactly one supported landscape video directly in `current_video/`.
-2. Replace the entire contents of `current_video/clips.json` with one of the examples below, changing its times and text as needed.
+2. Replace the entire contents of `current_video/clips.json` with one of the examples below, changing its name, timings, mode, and optional text as needed.
 3. From the `Video Cropper` folder, run these commands in order:
 
 ```bash
@@ -74,7 +70,7 @@ python3 video_cropper.py render
 
 `validate` checks the source and configuration. `dry-run` prints the FFmpeg plan without creating files. `render` writes the requested MP4 files to `current_video/outputs/`. The default render is sequential: one clip at a time. Use `python3 video_cropper.py render --jobs 2` or `--jobs 3` only when you want parallel encodes. If an output with the same filename already exists, review it first; use `python3 video_cropper.py render --overwrite` only when you intend to replace it.
 
-The commands are identical for every example; the JSON in `clips.json` is what chooses the clip timings, text, and colors.
+The commands are identical for every example; the JSON in `clips.json` chooses the clip timings, mode, optional text, and text colors.
 
 ### Optional on-screen text
 
@@ -100,6 +96,8 @@ For any other exact color, use a six-digit hex value in `#RRGGBB` form. For exam
 `random` is an optional special value requested for automatic color selection. It calculates one bright hex color from the clip/text/word data and keeps that same result on re-renders of the same configuration. It does **not** choose a new color for every frame or every render. Use a named preset or a specific hex value whenever you want an exact predictable color.
 
 ## Configuration examples
+
+These examples demonstrate both modes, `end` and `duration` ranges, gameplay-only clips, every supported text treatment, and a mixed-mode request.
 
 ### 1. Render a clip with no text
 
@@ -232,6 +230,62 @@ Run example 6 with the three commands in [How to use the tool](#how-to-use-the-t
 
 Run example 7 with the three commands in [How to use the tool](#how-to-use-the-tool). `random` calculates one stable bright color for this exact caption; use a named preset or hex value instead when you need an exact color.
 
+### 8. Make an original-format clip with an end time
+
+```json
+{
+  "clips": [
+    {
+      "name": "08_original_end",
+      "start": "00:15:00",
+      "end": "00:15:15",
+      "mode": "original"
+    }
+  ]
+}
+```
+
+Run example 8 with the three commands in [How to use the tool](#how-to-use-the-tool). It creates a timestamp-only 16:9 cut with no text or visual processing.
+
+### 9. Make an original-format clip with a duration
+
+```json
+{
+  "clips": [
+    {
+      "name": "09_original_duration",
+      "start": "15:16",
+      "duration": "02:25",
+      "mode": "original"
+    }
+  ]
+}
+```
+
+Run example 9 with the three commands in [How to use the tool](#how-to-use-the-tool). It creates a 2-minute, 25-second timestamp-only 16:9 cut.
+
+### 10. Use vertical and original clips in one request
+
+```json
+{
+  "clips": [
+    {
+      "name": "10_vertical",
+      "start": "00:20:00",
+      "duration": "00:10"
+    },
+    {
+      "name": "10_original",
+      "start": "00:21:00",
+      "duration": "00:10",
+      "mode": "original"
+    }
+  ]
+}
+```
+
+Run example 10 with the three commands in [How to use the tool](#how-to-use-the-tool). It creates one default vertical clip and one unprocessed original-format clip.
+
 ## Commands
 
 From this folder:
@@ -260,6 +314,12 @@ python3 video_cropper.py self-test
 
 ## Render specification
 
-Every output is rendered (never stream-copied) with frame-accurate video and audio trimming starting at timestamp zero. In the default `"vertical"` mode, it is exactly 1440×2560 at 60 fps, H.264 High / CRF 18 / 8-bit `yuv420p`, AAC 48 kHz stereo at 192 kbps, MP4 faststart, and SDR BT.709 metadata. Source gameplay audio is only trimmed and re-encoded as required—no narration, music, effects, muting, gain changes, or mixing.
+Every output is rendered (never stream-copied) with frame-accurate video and audio trimming starting at timestamp zero. Both modes create an MP4 with H.264 High video at CRF 18 in 8-bit `yuv420p`, AAC audio at 192 kbps, and `faststart` enabled. Source gameplay audio is only trimmed and re-encoded as required—no narration, music, effects, muting, gain changes, or mixing.
 
-The vertical layout is a 1440×2560 scale-cover, center-cropped background with Gaussian blur (`sigma=40`) and brightness `-0.18`, plus a sharp 1440×1920 scale-cover, center-cropped gameplay frame at `x=0, y=320`. There are no overlays other than the optional user-configured text described above. `"original"` mode instead preserves the source's 16:9 frame size and frame rate without visual processing. HDR-tagged sources are rejected because this tool does not tone-map HDR.
+### `vertical` output
+
+The default `vertical` mode is exactly 1440×2560 at 60 fps, with AAC 48 kHz stereo audio and SDR BT.709 metadata. Its layout is a 1440×2560 scale-cover, center-cropped background with Gaussian blur (`sigma=40`) and brightness `-0.18`, plus a sharp 1440×1920 scale-cover, center-cropped gameplay frame at `x=0, y=320`. There are no overlays other than the optional user-configured text described above.
+
+### `original` output
+
+`original` mode preserves the source's 16:9 frame dimensions and frame rate; for example, 1920×1080 remains 1920×1080 and 2560×1440 remains 2560×1440. It does not scale, crop, blur, force a frame rate, or add text. Its AAC output keeps the source audio's sample rate and channel count. HDR-tagged sources are rejected because this utility does not tone-map HDR.
