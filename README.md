@@ -1,6 +1,6 @@
 # Video Cropper
 
-`Video Cropper` is a disposable, local utility for turning exactly one landscape 16:9 gameplay video into several clean vertical social clips. It uses Python's standard library plus locally installed `ffmpeg` and `ffprobe`; it has no database, history, archive, cloud service, or dependency on any other project.
+`Video Cropper` is a disposable, local utility for turning exactly one landscape 16:9 gameplay video into clean vertical social clips or simple source-format cuts. It uses Python's standard library plus locally installed `ffmpeg` and `ffprobe`; it has no database, history, archive, cloud service, or dependency on any other project.
 
 ## Folder contract
 
@@ -35,6 +35,23 @@ Edit [`current_video/clips.json`](current_video/clips.json):
 
 Each clip needs a unique `name`, a `start`, and exactly one of `end` or `duration`. Timestamps support `HH:MM:SS`, `MM:SS`, and optional milliseconds. Every range is validated before any render: its end must follow its start and fall within the source duration. Names are converted to safe filenames; collisions after sanitization are rejected. The rendered filename is `<safe-name>.mp4`.
 
+`mode` is optional. It defaults to `"vertical"`, which is the existing 9:16 blurred-background layout. Set `"mode": "original"` for a plain 16:9 cut: the source is only trimmed to the requested timestamps, with no crop, scale, blur, forced frame rate, text, or other visual treatment. Its output keeps the source's frame dimensions and frame rate. The exact trim is re-encoded into MP4 so the clip starts and ends on the requested frames; it is not a keyframe-limited stream copy.
+
+For example, this makes an unadorned 16:9 clip:
+
+```json
+{
+  "clips": [
+    {
+      "name": "race_finish",
+      "start": "00:01:20.000",
+      "end": "00:01:35.000",
+      "mode": "original"
+    }
+  ]
+}
+```
+
 When working through Codex, each new request that supplies clip timings replaces the entire `clips` list for the active video. Old entries are never appended or carried into a new request, so stale instructions from a video you already deleted cannot be rendered accidentally.
 
 ## How to use the tool
@@ -61,7 +78,7 @@ The commands are identical for every example; the JSON in `clips.json` is what c
 
 ### Optional on-screen text
 
-Text is optional: omit `texts` to render gameplay only. When present, each item has a required `text`; all other text timing fields are optional. Text is top-centred, uses the fixed display treatment, respects the 120-pixel left/right safe area, wraps automatically to at most four lines, and appears/disappears without animation.
+Text is optional: omit `texts` to render gameplay only. It is available only in the default `"vertical"` mode; `"original"` rejects `texts` so it stays an unadorned source-format cut. When present, each item has a required `text`; all other text timing fields are optional. Text is top-centred, uses the fixed display treatment, respects the 120-pixel left/right safe area, wraps automatically to at most four lines, and appears/disappears without animation.
 
 - With only `text`, the caption starts at the clip's first frame and remains visible through its last frame.
 - To customize timing, use a text-relative `start` with either `end` or `duration`. Text timestamps are relative to the start of that clip, not the source video.
@@ -239,10 +256,10 @@ Run the small built-in automated verification with:
 python3 video_cropper.py self-test
 ```
 
-`self-test` is safe to run without an active source video. It checks that both `ffmpeg` and `ffprobe` are installed and runnable, validates timestamp/name/source-discovery rules, checks start/end and start/duration configuration, text defaults and custom timings, preset/hex/random word colors, four-line safe-area limits, and the ten-second seek rule. It also creates a tiny temporary video, renders a captioned clip, and verifies its H.264/AAC streams, dimensions, frame rate, BT.709 tags, zero timestamps, duration, and MP4 faststart layout with `ffprobe`. No files in `current_video/` are changed.
+`self-test` is safe to run without an active source video. It checks that both `ffmpeg` and `ffprobe` are installed and runnable, validates timestamp/name/source-discovery rules, checks start/end and start/duration configuration, text defaults and custom timings, preset/hex/random word colors, four-line safe-area limits, both render modes, and the ten-second seek rule. It also creates a tiny temporary video, renders a captioned clip, and verifies its H.264/AAC streams, dimensions, frame rate, BT.709 tags, zero timestamps, duration, and MP4 faststart layout with `ffprobe`. No files in `current_video/` are changed.
 
 ## Render specification
 
-Every output is rendered (never stream-copied) with frame-accurate video and audio trimming starting at timestamp zero. It is exactly 1440×2560 at 60 fps, H.264 High / CRF 18 / 8-bit `yuv420p`, AAC 48 kHz stereo at 192 kbps, MP4 faststart, and SDR BT.709 metadata. Source gameplay audio is only trimmed and re-encoded as required—no narration, music, effects, muting, gain changes, or mixing.
+Every output is rendered (never stream-copied) with frame-accurate video and audio trimming starting at timestamp zero. In the default `"vertical"` mode, it is exactly 1440×2560 at 60 fps, H.264 High / CRF 18 / 8-bit `yuv420p`, AAC 48 kHz stereo at 192 kbps, MP4 faststart, and SDR BT.709 metadata. Source gameplay audio is only trimmed and re-encoded as required—no narration, music, effects, muting, gain changes, or mixing.
 
-The layout is a 1440×2560 scale-cover, center-cropped background with Gaussian blur (`sigma=40`) and brightness `-0.18`, plus a sharp 1440×1920 scale-cover, center-cropped gameplay frame at `x=0, y=320`. There are no overlays other than the optional user-configured text described above. HDR-tagged sources are rejected because this tool does not tone-map HDR.
+The vertical layout is a 1440×2560 scale-cover, center-cropped background with Gaussian blur (`sigma=40`) and brightness `-0.18`, plus a sharp 1440×1920 scale-cover, center-cropped gameplay frame at `x=0, y=320`. There are no overlays other than the optional user-configured text described above. `"original"` mode instead preserves the source's 16:9 frame size and frame rate without visual processing. HDR-tagged sources are rejected because this tool does not tone-map HDR.

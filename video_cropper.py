@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render short 9:16 gameplay clips from one disposable source video.
+"""Render vertical or original-format gameplay clips from one disposable source video.
 
 Only Python's standard library is used.  FFmpeg and FFprobe must be available
 on PATH.
@@ -40,6 +40,9 @@ TEXT_LINE_STEP = 150
 TEXT_SAFE_MARGIN = 120
 TEXT_MAX_LINES = 4
 INPUT_SEEK_THRESHOLD = Decimal("10")
+DEFAULT_MODE = "vertical"
+ORIGINAL_MODE = "original"
+VALID_MODES = {DEFAULT_MODE, ORIGINAL_MODE}
 
 
 class CropperError(Exception):
@@ -61,6 +64,7 @@ class Clip:
     start: Decimal
     end: Decimal
     texts: tuple["TextOverlay", ...] = ()
+    mode: str = DEFAULT_MODE
 
     @property
     def filename(self) -> str:
@@ -233,6 +237,16 @@ def parse_color(value: Any, field: str) -> str:
     )
 
 
+def parse_mode(value: Any, prefix: str) -> str:
+    if value is None:
+        return DEFAULT_MODE
+    if not isinstance(value, str) or value not in VALID_MODES:
+        raise CropperError(
+            f"{prefix}.mode must be '{DEFAULT_MODE}' (the default) or '{ORIGINAL_MODE}'."
+        )
+    return value
+
+
 def parse_interval(
     entry: dict[str, Any],
     prefix: str,
@@ -336,8 +350,15 @@ def load_clips(config_path: Path, source_duration: Decimal) -> list[Clip]:
                 f"sanitization (output: {name}.mp4)."
             )
         seen.add(name.casefold())
-        start, end = parse_interval(entry, f"clips[{index}]", source_duration)
-        clips.append(Clip(name, start, end, load_texts(entry.get("texts"), end - start, index)))
+        prefix = f"clips[{index}]"
+        start, end = parse_interval(entry, prefix, source_duration)
+        mode = parse_mode(entry.get("mode"), prefix)
+        if mode == ORIGINAL_MODE and "texts" in entry:
+            raise CropperError(
+                f"{prefix}.texts is not supported when mode is '{ORIGINAL_MODE}'; "
+                "that mode makes an unadorned source-format clip."
+            )
+        clips.append(Clip(name, start, end, load_texts(entry.get("texts"), end - start, index), mode))
     return clips
 
 
@@ -442,6 +463,10 @@ def ffmpeg_filter(
     trim_start = clip.start - seek_start
     trim_end = clip.end - seek_start
     start, end = format(trim_start, "f"), format(trim_end, "f")
+    audio = f"[0:a:0]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a]"
+    if clip.mode == ORIGINAL_MODE:
+        return f"[0:v:0]trim=start={start}:end={end},setpts=PTS-STARTPTS[v];{audio}"
+
     graph = (
         f"[0:v:0]trim=start={start}:end={end},setpts=PTS-STARTPTS,split=2[bgsrc][fgsrc];"
         "[bgsrc]scale=1440:2560:force_original_aspect_ratio=increase,"
@@ -449,7 +474,7 @@ def ffmpeg_filter(
         "[fgsrc]scale=1440:1920:force_original_aspect_ratio=increase,"
         "crop=1440:1920[fg];"
         "[bg][fg]overlay=x=0:y=320:shortest=1,fps=60,setsar=1[composed];"
-        f"[0:a:0]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a]"
+        + audio
     )
     if subtitle_path is None:
         return graph.replace("setsar=1[composed];", "setsar=1,format=yuv420p[v];")
@@ -469,12 +494,22 @@ def build_ffmpeg_command(source: SourceInfo, clip: Clip, destination: Path, subt
     command.extend([
         "-i", str(source.path), "-filter_complex", ffmpeg_filter(clip, subtitle_path, input_seek=input_seek),
         "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-profile:v", "high", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-r", "60", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-color_range", "tv", "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
-        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-        "-movflags", "+faststart", "-map_metadata", "-1", str(destination),
     ])
+    if clip.mode == ORIGINAL_MODE:
+        # Filtering provides frame-accurate start and end boundaries while leaving
+        # the source frame size and frame rate intact.
+        command.extend([
+            "-c:v", "libx264", "-profile:v", "high", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination),
+        ])
+    else:
+        command.extend([
+            "-c:v", "libx264", "-profile:v", "high", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-r", "60", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-color_range", "tv", "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+            "-movflags", "+faststart", "-map_metadata", "-1", str(destination),
+        ])
     return command
 
 
@@ -489,7 +524,10 @@ def print_plan(source: SourceInfo, clips: list[Clip]) -> None:
     print(f"Source: {source.path.name} ({source.width}x{source.height}, {format_seconds(source.duration)})")
     print(f"Valid clips: {len(clips)}")
     for clip in clips:
-        print(f"  {clip.filename}: {format_seconds(clip.start)}–{format_seconds(clip.end)} ({format_seconds(clip.duration)}), {len(clip.texts)} text overlay(s)")
+        print(
+            f"  {clip.filename}: {format_seconds(clip.start)}–{format_seconds(clip.end)} "
+            f"({format_seconds(clip.duration)}), mode={clip.mode}, {len(clip.texts)} text overlay(s)"
+        )
 
 
 def render_one(source: SourceInfo, clip: Clip, overwrite: bool) -> str:
@@ -655,6 +693,27 @@ class CropperUnitTests(unittest.TestCase):
         self.assertIn("fps=60", filter_graph)
         self.assertIn("setsar=1", filter_graph)
 
+    def test_original_mode_keeps_only_the_trim_filters(self) -> None:
+        clip = Clip("example", Decimal("10"), Decimal("20"), mode=ORIGINAL_MODE)
+        filter_graph = ffmpeg_filter(clip)
+        self.assertIn("[0:v:0]trim=start=10:end=20,setpts=PTS-STARTPTS[v]", filter_graph)
+        self.assertIn("atrim=start=10:end=20", filter_graph)
+        self.assertNotIn("scale=", filter_graph)
+        self.assertNotIn("fps=", filter_graph)
+
+    def test_original_mode_rejects_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "clips.json"
+            config.write_text(
+                json.dumps({"clips": [{
+                    "name": "unadorned", "start": "00:00", "end": "00:01",
+                    "mode": "original", "texts": [{"text": "Not allowed"}],
+                }]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(CropperError):
+                load_clips(config, Decimal("3"))
+
     def test_long_clips_use_accurate_input_seek(self) -> None:
         source = SourceInfo(Path("gameplay.mov"), Decimal("3600"), 2560, 1440, "bt709")
         short = Clip("short", Decimal("10"), Decimal("12"))
@@ -663,6 +722,14 @@ class CropperUnitTests(unittest.TestCase):
         command = build_ffmpeg_command(source, long, Path("long.mp4"))
         self.assertEqual(command[5:8], ["-ss", "770", "-accurate_seek"])
         self.assertIn("trim=start=10:end=12", ffmpeg_filter(long))
+
+    def test_original_mode_command_does_not_force_vertical_output(self) -> None:
+        source = SourceInfo(Path("gameplay.mov"), Decimal("3600"), 2560, 1440, "bt709")
+        command = build_ffmpeg_command(
+            source, Clip("original", Decimal("10"), Decimal("12"), mode=ORIGINAL_MODE), Path("original.mp4")
+        )
+        self.assertNotIn("-r", command)
+        self.assertNotIn("-colorspace", command)
 
     def test_text_colors_and_word_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -810,6 +877,34 @@ class CropperRuntimeTests(unittest.TestCase):
             data = destination.read_bytes()
             self.assertLess(data.index(b"moov"), data.index(b"mdat"))
 
+            original_destination = folder / "source_format.mp4"
+            original = subprocess.run(
+                build_ffmpeg_command(
+                    source,
+                    Clip("source_format", Decimal(0), Decimal("0.2"), mode=ORIGINAL_MODE),
+                    original_destination,
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(original.returncode, 0, original.stderr)
+            original_probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries",
+                    "stream=codec_type,width,height,r_frame_rate:format=duration", "-of", "json",
+                    str(original_destination),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(original_probe.returncode, 0, original_probe.stderr)
+            original_payload = json.loads(original_probe.stdout)
+            original_video = next(stream for stream in original_payload["streams"] if stream["codec_type"] == "video")
+            self.assertEqual((original_video["width"], original_video["height"]), (640, 360))
+            self.assertEqual(original_video["r_frame_rate"], "60/1")
+
 
 def command_self_test(_: argparse.Namespace) -> int:
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
@@ -819,7 +914,7 @@ def command_self_test(_: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Make vertical, blurred-band gameplay clips from one current_video source."
+        description="Make vertical or original-format gameplay clips from one current_video source."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name, handler in (("validate", command_validate), ("dry-run", command_dry_run), ("self-test", command_self_test)):
