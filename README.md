@@ -31,7 +31,7 @@ Each clip has a `mode` field. Video Cropper supports exactly these two values:
 
 `mode` belongs inside each clip object. If it is omitted, the clip uses `"vertical"`. Clips in the same `clips` array may use different modes. Any value other than `"vertical"` or `"original"` fails validation.
 
-`original` mode is for the same landscape 16:9 SDR source accepted by this utility. It preserves that source's frame dimensions and frame rate, including 2560×1440 (2K) sources. It still re-encodes the exact range into MP4 so the clip starts and ends on the requested frames; it is not a keyframe-limited stream copy. `texts` is not allowed in `original` mode, including an empty `texts` array.
+`original` mode is for the same landscape 16:9 SDR source accepted by this utility. It preserves that source's frame dimensions and nominal frame rate, including 2560×1440 (2K) sources. It still re-encodes the exact range into an iPhone-compatible H.264/AAC MP4 so the clip starts and ends on the requested frames; it is not a keyframe-limited stream copy. `texts` is not allowed in `original` mode, including an empty `texts` array.
 
 ## Clip configuration
 
@@ -322,4 +322,4 @@ The default `vertical` mode is exactly 1440×2560 at 60 fps, with AAC 48 kHz ste
 
 ### `original` output
 
-`original` mode preserves the source's 16:9 frame dimensions and frame rate; for example, 1920×1080 remains 1920×1080 and 2560×1440 remains 2560×1440. It does not scale, crop, blur, force a frame rate, or add text. Its AAC output keeps the source audio's sample rate and channel count. HDR-tagged sources are rejected because this utility does not tone-map HDR.
+`original` mode preserves the source's 16:9 frame dimensions and nominal frame rate; for example, 1920×1080 at 59.94 fps remains 1920×1080 at 59.94 fps, and 2560×1440 at 60 fps remains 2560×1440 at 60 fps. It does not scale, crop, blur, or add text. It explicitly declares that source rate to the H.264 encoder so it produces a level appropriate for the clip rather than an unnecessarily high level that iPhone Photos can reject. Its AAC output keeps the source audio's sample rate and channel count. HDR-tagged sources are rejected because this utility does not tone-map HDR.

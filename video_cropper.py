@@ -56,6 +56,9 @@ class SourceInfo:
     width: int
     height: int
     color_transfer: str | None
+    frame_rate: str = "60/1"
+    color_space: str | None = None
+    color_primaries: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,8 @@ def run_ffprobe(source: Path) -> SourceInfo:
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,width,height,color_transfer,channels,sample_rate",
+        "format=duration:stream=codec_type,width,height,r_frame_rate,color_space,color_transfer,"
+        "color_primaries,channels,sample_rate",
         "-of",
         "json",
         str(source),
@@ -160,6 +164,11 @@ def run_ffprobe(source: Path) -> SourceInfo:
             f"{source.name} is {width}x{height}, not a landscape source video. "
             "This utility expects a landscape 16:9 gameplay video."
         )
+    frame_rate = video.get("r_frame_rate")
+    if not isinstance(frame_rate, str) or not re.fullmatch(r"[1-9]\d*/[1-9]\d*", frame_rate):
+        raise CropperError(
+            f"Could not read a usable frame rate from {source.name}."
+        )
     # Allow small encoder rounding differences while rejecting substantially non-16:9 video.
     if abs((width / height) - (16 / 9)) > 0.02:
         raise CropperError(
@@ -172,7 +181,16 @@ def run_ffprobe(source: Path) -> SourceInfo:
             f"{source.name} is tagged as HDR ({transfer}). This renderer deliberately "
             "accepts SDR sources only and does not tone-map HDR."
         )
-    return SourceInfo(source, duration, width, height, transfer)
+    return SourceInfo(
+        source,
+        duration,
+        width,
+        height,
+        transfer,
+        frame_rate,
+        video.get("color_space"),
+        video.get("color_primaries"),
+    )
 
 
 def parse_timestamp(value: Any) -> Decimal:
@@ -497,9 +515,22 @@ def build_ffmpeg_command(source: SourceInfo, clip: Clip, destination: Path, subt
     ])
     if clip.mode == ORIGINAL_MODE:
         # Filtering provides frame-accurate start and end boundaries while leaving
-        # the source frame size and frame rate intact.
+        # the source frame size intact. FFmpeg otherwise passes the filter's fine
+        # time base to x264, which can make a normal 1080p60 clip advertise an
+        # unnecessarily high H.264 level that Photos rejects. Declare the source's
+        # nominal rate explicitly so the output is CFR at that same rate.
         command.extend([
             "-c:v", "libx264", "-profile:v", "high", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-r", source.frame_rate, "-fps_mode", "cfr",
+            "-colorspace", source.color_space or "bt709",
+            "-color_primaries", source.color_primaries or "bt709",
+            "-color_trc", source.color_transfer or "bt709",
+            "-color_range", "tv",
+            "-x264-params", (
+                f"colorprim={source.color_primaries or 'bt709'}:"
+                f"transfer={source.color_transfer or 'bt709'}:"
+                f"colormatrix={source.color_space or 'bt709'}"
+            ),
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination),
         ])
     else:
@@ -724,12 +755,16 @@ class CropperUnitTests(unittest.TestCase):
         self.assertIn("trim=start=10:end=12", ffmpeg_filter(long))
 
     def test_original_mode_command_does_not_force_vertical_output(self) -> None:
-        source = SourceInfo(Path("gameplay.mov"), Decimal("3600"), 2560, 1440, "bt709")
+        source = SourceInfo(
+            Path("gameplay.mov"), Decimal("3600"), 2560, 1440,
+            "bt709", "60000/1001", "bt709", "bt709",
+        )
         command = build_ffmpeg_command(
             source, Clip("original", Decimal("10"), Decimal("12"), mode=ORIGINAL_MODE), Path("original.mp4")
         )
-        self.assertNotIn("-r", command)
-        self.assertNotIn("-colorspace", command)
+        self.assertEqual(command[command.index("-r") + 1], "60000/1001")
+        self.assertEqual(command[command.index("-fps_mode") + 1], "cfr")
+        self.assertEqual(command[command.index("-colorspace") + 1], "bt709")
 
     def test_text_colors_and_word_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -892,7 +927,8 @@ class CropperRuntimeTests(unittest.TestCase):
             original_probe = subprocess.run(
                 [
                     "ffprobe", "-v", "error", "-show_entries",
-                    "stream=codec_type,width,height,r_frame_rate:format=duration", "-of", "json",
+                    "stream=codec_type,codec_name,profile,level,width,height,r_frame_rate,color_space,"
+                    "color_transfer,color_primaries:format=duration", "-of", "json",
                     str(original_destination),
                 ],
                 text=True,
@@ -902,8 +938,14 @@ class CropperRuntimeTests(unittest.TestCase):
             self.assertEqual(original_probe.returncode, 0, original_probe.stderr)
             original_payload = json.loads(original_probe.stdout)
             original_video = next(stream for stream in original_payload["streams"] if stream["codec_type"] == "video")
+            self.assertEqual((original_video["codec_name"], original_video["profile"]), ("h264", "High"))
             self.assertEqual((original_video["width"], original_video["height"]), (640, 360))
             self.assertEqual(original_video["r_frame_rate"], "60/1")
+            self.assertLessEqual(original_video["level"], 52)
+            self.assertEqual(
+                (original_video["color_space"], original_video["color_transfer"], original_video["color_primaries"]),
+                ("bt709", "bt709", "bt709"),
+            )
 
 
 def command_self_test(_: argparse.Namespace) -> int:
