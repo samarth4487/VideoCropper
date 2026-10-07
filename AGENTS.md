@@ -42,9 +42,19 @@ When the user supplies clip names and time ranges, or says they edited `clips.js
 6. If an output already exists, stop and report the exact conflicting file(s). Only run `render --overwrite` when the user explicitly authorizes replacing those outputs.
 7. Report the rendered filenames and any failures succinctly. Do not claim a render succeeded without checking the command result.
 
+## Live progress for terminal and assistant callers
+
+- `render` automatically emits flushed, newline-delimited progress for each clip: a starting line at 0%, then 10%, 20%, through 90%. Each line includes the output filename; parallel jobs track their clips independently.
+- Percentages measure encoded clip time, excluding seek pre-roll, rather than elapsed wall-clock time. Do not estimate progress from output file size or elapsed time when the renderer provides actual milestones.
+- 100% is printed only after FFmpeg succeeds, MP4 finalization finishes, and the completed output is moved into place. A failure or cancellation must not be described as complete.
+- When rendering through an assistant, use an execution tool that returns a running session and incremental stdout. Monitor that session at short intervals (about five seconds when supported) and relay every newly received 10% milestone to the user while rendering. If several milestones arrive together, show them together with their filenames; do not discard intermediate milestones or substitute generic updates.
+- The renderer flushes output even through pipes; no `python3 -u` flag is required. If the caller only returns output after process exit, explain that limitation instead of claiming live chat notifications. No external messaging, progress log, or history system is needed.
+
 For clips starting after `00:00:10`, the utility performs an accurate FFmpeg input seek to exactly ten seconds before the requested start before decoding; do not replace this with a command that decodes all earlier source footage. Starts at or before ten seconds intentionally begin from the source start. The utility trims away that pre-roll and preserves frame-accurate clip boundaries.
 
 The user asking for specific clips is authorization to replace `clips.json` with that requested list and render those requested clips after validation. It is not authorization to overwrite clips from a prior configuration.
+
+When the user asks to empty the clipping instructions while preserving the source and outputs, write `{"clips": []}` rather than a zero-byte file. An empty list is a valid idle state: `validate` still checks the source, while `dry-run` and `render` report that there is nothing to render and leave outputs untouched.
 
 ## On-screen text
 

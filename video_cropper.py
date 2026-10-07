@@ -9,15 +9,21 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from collections import deque
+import contextlib
 import hashlib
+import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -43,6 +49,7 @@ INPUT_SEEK_THRESHOLD = Decimal("10")
 DEFAULT_MODE = "vertical"
 ORIGINAL_MODE = "original"
 VALID_MODES = {DEFAULT_MODE, ORIGINAL_MODE}
+PRINT_LOCK = threading.Lock()
 
 
 class CropperError(Exception):
@@ -353,8 +360,8 @@ def load_clips(config_path: Path, source_duration: Decimal) -> list[Clip]:
     except (OSError, json.JSONDecodeError) as exc:
         raise CropperError(f"Could not read valid JSON from {config_path}: {exc}") from exc
     entries = document.get("clips") if isinstance(document, dict) else None
-    if not isinstance(entries, list) or not entries:
-        raise CropperError(f"{config_path} must contain a non-empty 'clips' array.")
+    if not isinstance(entries, list):
+        raise CropperError(f"{config_path} must contain a 'clips' array (which may be empty).")
 
     clips: list[Clip] = []
     seen: set[str] = set()
@@ -504,7 +511,10 @@ def ffmpeg_filter(
 
 def build_ffmpeg_command(source: SourceInfo, clip: Clip, destination: Path, subtitle_path: Path | None = None) -> list[str]:
     input_seek = should_seek_input(clip)
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-nostdin", "-nostats", "-progress", "pipe:1", "-stats_period", "1",
+    ]
     if input_seek:
         # Input seeking is accurate for re-encoding: FFmpeg seeks to a nearby
         # keyframe then decodes/discards frames until the pre-roll timestamp.
@@ -561,9 +571,111 @@ def print_plan(source: SourceInfo, clips: list[Clip]) -> None:
         )
 
 
-def render_one(source: SourceInfo, clip: Clip, overwrite: bool) -> str:
+def print_status(message: str) -> None:
+    """Flush complete lines for terminals and callers capturing piped output."""
+    with PRINT_LOCK:
+        print(message, flush=True)
+
+
+@dataclass
+class RenderProgress:
+    clip: Clip
+    next_percent: int = 10
+
+    def update(self, output_time_us: str) -> None:
+        try:
+            encoded_us = Decimal(output_time_us)
+        except InvalidOperation:
+            return
+        if not encoded_us.is_finite() or encoded_us < 0:
+            return
+        total_us = self.clip.duration * 1_000_000
+        # Catch up crossed milestones, ignore repeats/regressions, and reserve
+        # 100% for a successful exit and publication of the completed MP4.
+        while self.next_percent <= 90 and encoded_us * 100 >= total_us * self.next_percent:
+            print_status(f"[{self.clip.filename}] {self.next_percent}%")
+            self.next_percent += 10
+
+
+def run_ffmpeg_with_progress(
+    command: list[str], clip: Clip, cancel: threading.Event | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Drain both pipes live; keep a bounded error tail without blocking FFmpeg."""
+    progress = RenderProgress(clip)
+    updates: queue.Queue[str | None] = queue.Queue()
+    errors: deque[str] = deque(maxlen=200)
+    process = subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    assert process.stdout is not None and process.stderr is not None
+
+    def read_progress() -> None:
+        try:
+            for line in process.stdout:
+                updates.put(line)
+        finally:
+            updates.put(None)
+
+    def read_errors() -> None:
+        for line in process.stderr:
+            errors.append(line[-2000:])
+
+    readers = [threading.Thread(target=read_progress), threading.Thread(target=read_errors)]
+    for reader in readers:
+        reader.start()
+    try:
+        output_time_us: str | None = None
+        stream_ended = False
+        while not stream_ended or process.poll() is None:
+            if cancel is not None and cancel.is_set():
+                raise CropperError(f"{clip.filename} cancelled.")
+            try:
+                line = updates.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if line is None:
+                stream_ended = True
+                continue
+            key, separator, value = line.strip().partition("=")
+            if not separator:
+                continue
+            if key == "out_time_us":
+                output_time_us = value
+            elif key == "progress":
+                if value in ("continue", "end") and output_time_us is not None:
+                    progress.update(output_time_us)
+                output_time_us = None
+        returncode = process.wait()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for reader in readers:
+            reader.join()
+        process.stdout.close()
+        process.stderr.close()
+    if returncode == 0:
+        # FFmpeg can report the timestamp at the start of the last packet,
+        # slightly short of the full duration. A successful exit confirms the
+        # remaining encoding milestones; publication still owns 100%.
+        progress.update(str(clip.duration * 1_000_000))
+    return subprocess.CompletedProcess(command, returncode, stderr="".join(errors))
+
+
+def render_one(
+    source: SourceInfo, clip: Clip, overwrite: bool, cancel: threading.Event | None = None
+) -> str:
+    if cancel is not None and cancel.is_set():
+        raise CropperError(f"{clip.filename} cancelled.")
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     destination = OUTPUTS / clip.filename
+    if destination.exists() and not overwrite:
+        raise CropperError(f"Refusing to overwrite existing output: {destination}. Use --overwrite.")
     temporary = OUTPUTS / f".{clip.name}.partial.mp4"
     subtitles = CURRENT_VIDEO / f".{clip.name}.text.ass"
     if temporary.exists() or temporary.is_symlink():
@@ -571,16 +683,30 @@ def render_one(source: SourceInfo, clip: Clip, overwrite: bool) -> str:
     if clip.texts:
         subtitles.write_text(make_ass(clip), encoding="utf-8")
     command = build_ffmpeg_command(source, clip, temporary, subtitles if clip.texts else None)
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
-    subtitles.unlink(missing_ok=True)
+    print_status(f"[{clip.filename}] Starting render (0%)")
+    try:
+        result = run_ffmpeg_with_progress(command, clip, cancel)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        subtitles.unlink(missing_ok=True)
     if result.returncode != 0:
         temporary.unlink(missing_ok=True)
         detail = result.stderr.strip() or "ffmpeg returned no diagnostic output."
         raise CropperError(f"{clip.filename} failed: {detail}")
+    if cancel is not None and cancel.is_set():
+        temporary.unlink(missing_ok=True)
+        raise CropperError(f"{clip.filename} cancelled.")
     if destination.exists() and not overwrite:
         temporary.unlink(missing_ok=True)
         raise CropperError(f"Refusing to overwrite existing output: {destination}. Use --overwrite.")
-    os.replace(temporary, destination)
+    try:
+        os.replace(temporary, destination)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise CropperError(f"{clip.filename} could not be saved: {exc}") from exc
+    print_status(f"[{clip.filename}] 100% — complete")
     return clip.filename
 
 
@@ -594,6 +720,9 @@ def command_validate(_: argparse.Namespace) -> int:
 def command_dry_run(_: argparse.Namespace) -> int:
     source, clips = validate_project()
     print_plan(source, clips)
+    if not clips:
+        print_status("No clips configured; nothing to render.")
+        return 0
     print("\nFFmpeg commands (no files will be created):")
     for clip in clips:
         temporary = OUTPUTS / f".{clip.name}.partial.mp4"
@@ -604,6 +733,10 @@ def command_dry_run(_: argparse.Namespace) -> int:
 
 def command_render(args: argparse.Namespace) -> int:
     source, clips = validate_project()
+    if not clips:
+        print_plan(source, clips)
+        print_status("No clips configured; nothing to render.")
+        return 0
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     conflicts = [clip.filename for clip in clips if (OUTPUTS / clip.filename).exists()]
     if conflicts and not args.overwrite:
@@ -611,21 +744,30 @@ def command_render(args: argparse.Namespace) -> int:
             "Refusing to overwrite existing output(s): " + ", ".join(conflicts) + ". Use --overwrite."
         )
     print_plan(source, clips)
-    print(f"Rendering {len(clips)} clip(s) with {args.jobs} job(s)...")
+    print_status(f"Rendering {len(clips)} clip(s) with {args.jobs} job(s)...")
     failures: list[str] = []
+    cancel = threading.Event()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
-        futures = {executor.submit(render_one, source, clip, args.overwrite): clip for clip in clips}
-        for future in concurrent.futures.as_completed(futures):
-            clip = futures[future]
-            try:
-                print(f"Rendered: {future.result()}")
-            except CropperError as exc:
-                failures.append(str(exc))
-            except Exception as exc:  # pragma: no cover - defensive reporting around subprocess threads
-                failures.append(f"{clip.filename} failed unexpectedly: {exc}")
+        futures: dict[concurrent.futures.Future[str], Clip] = {}
+        try:
+            for clip in clips:
+                futures[executor.submit(render_one, source, clip, args.overwrite, cancel)] = clip
+            for future in concurrent.futures.as_completed(futures):
+                clip = futures[future]
+                try:
+                    print_status(f"Rendered: {future.result()}")
+                except CropperError as exc:
+                    failures.append(str(exc))
+                except Exception as exc:  # pragma: no cover - defensive reporting around subprocess threads
+                    failures.append(f"{clip.filename} failed unexpectedly: {exc}")
+        except KeyboardInterrupt:
+            cancel.set()
+            for future in futures:
+                future.cancel()
+            raise
     if failures:
         raise CropperError("Rendering finished with failures:\n  " + "\n  ".join(failures))
-    print("Rendering complete.")
+    print_status("Rendering complete.")
     return 0
 
 
@@ -662,6 +804,49 @@ def shlex_join(command: list[str]) -> str:
 
 
 class CropperUnitTests(unittest.TestCase):
+    def test_empty_clip_list_is_valid_but_missing_or_malformed_configuration_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "clips.json"
+            config.write_text('{"clips": []}', encoding="utf-8")
+            self.assertEqual(load_clips(config, Decimal("60")), [])
+            for document in ("", "{}", '{"clips": null}', '{"clips": {}}'):
+                config.write_text(document, encoding="utf-8")
+                with self.assertRaises(CropperError):
+                    load_clips(config, Decimal("60"))
+
+    def test_empty_render_and_dry_run_do_not_create_or_modify_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            outputs = folder / "outputs"
+            source = SourceInfo(folder / "source.mov", Decimal("60"), 640, 360, "bt709")
+            with patch.object(sys.modules[__name__], "validate_project", return_value=(source, [])), \
+                    patch.object(sys.modules[__name__], "OUTPUTS", outputs), \
+                    patch.object(sys.modules[__name__], "render_one") as render:
+                for handler in (command_render, command_dry_run):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(handler(argparse.Namespace(jobs=1, overwrite=False)), 0)
+                    self.assertIn("No clips configured; nothing to render.", output.getvalue())
+                    self.assertFalse(outputs.exists())
+                outputs.mkdir()
+                existing = outputs / "preserved.mp4"
+                existing.write_bytes(b"preserved")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(command_render(argparse.Namespace(jobs=2, overwrite=True)), 0)
+                self.assertEqual(existing.read_bytes(), b"preserved")
+                render.assert_not_called()
+
+    def test_progress_handles_jumps_duplicates_and_invalid_timestamps(self) -> None:
+        output = io.StringIO()
+        progress = RenderProgress(Clip("progress", Decimal("60"), Decimal("120")))
+        with contextlib.redirect_stdout(output):
+            for value in ("N/A", "NaN", "Infinity", "-1000", "5999999", "18000000", "18000000", "6000000", "90000000"):
+                progress.update(value)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [f"[progress.mp4] {percent}%" for percent in range(10, 100, 10)],
+        )
+
     def test_timestamp_formats(self) -> None:
         self.assertEqual(parse_timestamp("00:01:02.500"), Decimal("62.500"))
         self.assertEqual(parse_timestamp("01:02.5"), Decimal("62.5"))
@@ -751,7 +936,8 @@ class CropperUnitTests(unittest.TestCase):
         long = Clip("long", Decimal("780"), Decimal("782"))
         self.assertNotIn("-ss", build_ffmpeg_command(source, short, Path("short.mp4")))
         command = build_ffmpeg_command(source, long, Path("long.mp4"))
-        self.assertEqual(command[5:8], ["-ss", "770", "-accurate_seek"])
+        seek_index = command.index("-ss")
+        self.assertEqual(command[seek_index:seek_index + 3], ["-ss", "770", "-accurate_seek"])
         self.assertIn("trim=start=10:end=12", ffmpeg_filter(long))
 
     def test_original_mode_command_does_not_force_vertical_output(self) -> None:
@@ -841,6 +1027,130 @@ class CropperUnitTests(unittest.TestCase):
 
 
 class CropperRuntimeTests(unittest.TestCase):
+    def test_progress_is_live_and_stderr_cannot_block_it(self) -> None:
+        clip = Clip("live", Decimal(0), Decimal("10"))
+        milestone = threading.Event()
+        lines: list[str] = []
+
+        def observe(message: str) -> None:
+            lines.append(message)
+            milestone.set()
+
+        with tempfile.TemporaryDirectory(prefix="video-cropper-self-test-") as temp:
+            gate = Path(temp) / "finish"
+            command = [sys.executable, "-c", (
+                "import pathlib, sys, time\n"
+                "sys.stderr.write('diagnostic:' + 'x' * 200000 + '\\n'); sys.stderr.flush()\n"
+                "print('out_time_us=1000000\\nprogress=continue', flush=True)\n"
+                "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.02)\n"
+                "print('out_time_us=10000000\\nprogress=end', flush=True)\n"
+            ), str(gate)]
+            with patch.object(sys.modules[__name__], "print_status", side_effect=observe):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_ffmpeg_with_progress, command, clip)
+                    try:
+                        self.assertTrue(milestone.wait(timeout=5), "No live milestone received")
+                        self.assertFalse(future.done(), "Progress was buffered until process exit")
+                    finally:
+                        # A gate instead of a timed sleep makes this check
+                        # deterministic even on a busy machine.
+                        gate.touch()
+                    result = future.result(timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertLessEqual(len(result.stderr), 2000)
+        self.assertEqual(lines, [f"[live.mp4] {percent}%" for percent in range(10, 100, 10)])
+
+    def test_failed_render_keeps_existing_output_and_never_reports_complete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="video-cropper-self-test-") as temp:
+            folder = Path(temp)
+            clip = Clip("failure", Decimal(0), Decimal("10"))
+            source = SourceInfo(folder / "missing.mp4", Decimal("10"), 640, 360, "bt709")
+            destination = folder / clip.filename
+            destination.write_bytes(b"existing output")
+            command = [sys.executable, "-c", (
+                "import pathlib, sys\n"
+                "pathlib.Path(sys.argv[1]).write_bytes(b'incomplete output')\n"
+                "print('out_time_us=10000000\\nprogress=end', flush=True)\n"
+                "print('sample encoding failure', file=sys.stderr)\n"
+                "sys.exit(1)\n"
+            ), str(folder / ".failure.partial.mp4")]
+            output = io.StringIO()
+            with patch.multiple(sys.modules[__name__], CURRENT_VIDEO=folder, OUTPUTS=folder), \
+                    patch.object(sys.modules[__name__], "build_ffmpeg_command", return_value=command), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaisesRegex(CropperError, "sample encoding failure"):
+                    render_one(source, clip, overwrite=True)
+            self.assertNotIn("100%", output.getvalue())
+            self.assertEqual(destination.read_bytes(), b"existing output")
+            self.assertFalse((folder / ".failure.partial.mp4").exists())
+
+    def test_parallel_clips_have_independent_milestones_and_publish_before_complete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="video-cropper-self-test-") as temp:
+            folder = Path(temp)
+            clips = [Clip("first", Decimal(0), Decimal("10")), Clip("second", Decimal("60"), Decimal("80"))]
+            source = SourceInfo(folder / "unused.mp4", Decimal("80"), 640, 360, "bt709")
+            script = (
+                "import pathlib, sys\n"
+                "print('out_time_us=' + sys.argv[2] + '\\nprogress=end', flush=True)\n"
+                "pathlib.Path(sys.argv[1]).write_bytes(b'completed sample')\n"
+            )
+
+            def fake_command(source: SourceInfo, clip: Clip, destination: Path, subtitles: Path | None) -> list[str]:
+                return [sys.executable, "-c", script, str(destination), str(clip.duration * 1_000_000)]
+
+            real_print_status = print_status
+
+            def observe(message: str) -> None:
+                if "100%" in message:
+                    filename = message.split("]", 1)[0][1:]
+                    self.assertEqual((folder / filename).read_bytes(), b"completed sample")
+                real_print_status(message)
+
+            output = io.StringIO()
+            with patch.multiple(sys.modules[__name__], CURRENT_VIDEO=folder, OUTPUTS=folder), \
+                    patch.object(sys.modules[__name__], "build_ffmpeg_command", side_effect=fake_command), \
+                    patch.object(sys.modules[__name__], "print_status", side_effect=observe), \
+                    contextlib.redirect_stdout(output):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(render_one, source, clip, False) for clip in clips]
+                    for future, clip in zip(futures, clips):
+                        self.assertEqual(future.result(timeout=5), clip.filename)
+            for clip in clips:
+                self.assertEqual(
+                    [line for line in output.getvalue().splitlines() if line.startswith(f"[{clip.filename}]")],
+                    [f"[{clip.filename}] Starting render (0%)"]
+                    + [f"[{clip.filename}] {percent}%" for percent in range(10, 100, 10)]
+                    + [f"[{clip.filename}] 100% — complete"],
+                )
+
+    def test_cancel_stops_a_process_without_waiting_for_progress(self) -> None:
+        clip = Clip("cancel", Decimal(0), Decimal("10"))
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaisesRegex(CropperError, "cancelled"):
+            run_ffmpeg_with_progress([sys.executable, "-c", "import time; time.sleep(30)"], clip, cancel)
+
+    def test_publication_failure_never_reports_complete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="video-cropper-self-test-") as temp:
+            folder = Path(temp)
+            clip = Clip("publish", Decimal(0), Decimal("10"))
+            source = SourceInfo(folder / "unused.mp4", Decimal("10"), 640, 360, "bt709")
+            output = io.StringIO()
+            temporary = folder / ".publish.partial.mp4"
+            command = [sys.executable, "-c", (
+                "import pathlib, sys\n"
+                "pathlib.Path(sys.argv[1]).write_bytes(b'encoded output')\n"
+            ), str(temporary)]
+            with patch.multiple(sys.modules[__name__], CURRENT_VIDEO=folder, OUTPUTS=folder), \
+                    patch.object(sys.modules[__name__], "build_ffmpeg_command", return_value=command), \
+                    patch.object(os, "replace", side_effect=OSError("sample publication failure")), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaisesRegex(CropperError, "sample publication failure"):
+                    render_one(source, clip, False)
+            self.assertNotIn("100%", output.getvalue())
+            self.assertFalse((folder / clip.filename).exists())
+            self.assertFalse(temporary.exists())
+
     def test_required_tools_are_installed_and_runnable(self) -> None:
         require_binaries()
         for executable in ("ffmpeg", "ffprobe"):
@@ -875,16 +1185,17 @@ class CropperRuntimeTests(unittest.TestCase):
                 Decimal("0.2"),
                 (TextOverlay("Clean racing", Decimal(0), Decimal("0.2"), "#FFFFFF", ((2, "#34C759"),)),),
             )
-            subtitles = folder / "caption.ass"
-            subtitles.write_text(make_ass(clip), encoding="utf-8")
-            destination = folder / "rendered.mp4"
-            rendered = subprocess.run(
-                build_ffmpeg_command(source, clip, destination, subtitles),
-                text=True,
-                capture_output=True,
-                check=False,
+            destination = folder / clip.filename
+            output = io.StringIO()
+            with patch.multiple(sys.modules[__name__], CURRENT_VIDEO=folder, OUTPUTS=folder), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(render_one(source, clip, False), clip.filename)
+            self.assertEqual(
+                output.getvalue().splitlines(),
+                [f"[{clip.filename}] Starting render (0%)"]
+                + [f"[{clip.filename}] {percent}%" for percent in range(10, 100, 10)]
+                + [f"[{clip.filename}] 100% — complete"],
             )
-            self.assertEqual(rendered.returncode, 0, rendered.stderr)
             inspected = subprocess.run(
                 [
                     "ffprobe", "-v", "error",
@@ -912,18 +1223,18 @@ class CropperRuntimeTests(unittest.TestCase):
             data = destination.read_bytes()
             self.assertLess(data.index(b"moov"), data.index(b"mdat"))
 
-            original_destination = folder / "source_format.mp4"
-            original = subprocess.run(
-                build_ffmpeg_command(
-                    source,
-                    Clip("source_format", Decimal(0), Decimal("0.2"), mode=ORIGINAL_MODE),
-                    original_destination,
-                ),
-                text=True,
-                capture_output=True,
-                check=False,
+            original_clip = Clip("source_format", Decimal(0), Decimal("0.2"), mode=ORIGINAL_MODE)
+            original_destination = folder / original_clip.filename
+            output = io.StringIO()
+            with patch.multiple(sys.modules[__name__], CURRENT_VIDEO=folder, OUTPUTS=folder), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(render_one(source, original_clip, False), original_clip.filename)
+            self.assertEqual(
+                output.getvalue().splitlines(),
+                [f"[{original_clip.filename}] Starting render (0%)"]
+                + [f"[{original_clip.filename}] {percent}%" for percent in range(10, 100, 10)]
+                + [f"[{original_clip.filename}] 100% — complete"],
             )
-            self.assertEqual(original.returncode, 0, original.stderr)
             original_probe = subprocess.run(
                 [
                     "ffprobe", "-v", "error", "-show_entries",

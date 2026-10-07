@@ -48,6 +48,16 @@ Edit [`current_video/clips.json`](current_video/clips.json):
 
 Each clip needs a unique `name`, a `start`, exactly one of `end` or `duration`, and an optional `mode`. Timestamps support `HH:MM:SS`, `MM:SS`, and optional milliseconds. Every range is validated before any render: its end must follow its start and fall within the source duration. Names are converted to safe filenames; collisions after sanitization are rejected. The rendered filename is `<safe-name>.mp4`.
 
+To leave the active source in place with no pending clips, use valid JSON with an empty array:
+
+```json
+{
+  "clips": []
+}
+```
+
+`validate` still checks the source and accepts zero clips. `dry-run` and `render` report `No clips configured; nothing to render.` without creating, deleting, or changing outputs. A zero-byte file, missing `clips` field, or non-array value remains invalid. Emptying this list does not delete the source or any completed clip; it only clears pending render instructions.
+
 When working through Codex, each new request that supplies clip timings replaces the entire `clips` list for the active video. Old entries are never appended or carried into a new request, so stale instructions from a video you already deleted cannot be rendered accidentally.
 
 ## How to use the tool
@@ -302,6 +312,29 @@ python3 video_cropper.py clear --yes
 
 `validate` checks FFmpeg, source discovery, video/audio streams, source duration, and all clipping instructions. `dry-run` performs the same validation and prints the exact safe FFmpeg argument commands without writing files. `render` runs all clips (one job by default); it refuses to replace an existing output unless `--overwrite` is explicit. Each clip renders first to a temporary file and is moved into place only after FFmpeg succeeds.
 
+### Live render progress
+
+Every `render` automatically prints a starting line followed by one line at each 10% milestone for each clip. No flag or additional package is needed:
+
+```text
+[sample.mp4] Starting render (0%)
+[sample.mp4] 10%
+[sample.mp4] 20%
+...
+[sample.mp4] 90%
+[sample.mp4] 100% — complete
+Rendered: sample.mp4
+Rendering complete.
+```
+
+Progress comes from FFmpeg's structured `-progress pipe:1` output, sampled approximately once per second. The percentage measures encoded output time divided by the requested clip duration, excluding source footage before the clip and the ten-second seek pre-roll. For a 60-second clip, each six seconds of encoded output crosses another 10% milestone. Encoding speed varies, so these are not equally spaced wall-clock notifications or a prediction of time remaining.
+
+Each milestone is printed once. If one FFmpeg update crosses several milestones, they are printed together in order; very short clips may print most of their milestones together. 100% is reserved until FFmpeg exits successfully, finishes MP4 finalization (including faststart), and the completed file is moved into place. Finalization may therefore leave the display at 90% briefly. Failed or cancelled clips never report 100% or complete. FFmpeg errors are drained concurrently and the last 200 lines (up to 2,000 characters per line) are retained for diagnostics. Ctrl+C stops running encoders and cleans their temporary files; completed outputs are preserved.
+
+With `--jobs N`, each clip has independent progress. Lines from different clips may alternate, and every line includes its filename. Complete lines are synchronized and immediately flushed to stdout, including when stdout is a pipe rather than a terminal.
+
+The same `python3 video_cropper.py render` command works directly in the terminal or through a local execution tool used by ChatGPT, Claude, or another assistant. To show progress in chat while rendering, the assistant's execution tool must expose a running command session and incremental output. The assistant should read that session regularly and relay every newly received milestone, grouping milestones received together if needed. A tool that buffers the entire command until exit can only show the updates afterward; printing from the renderer cannot bypass that tool's buffering. No notification service, saved progress log, or external account is required.
+
 For a clip whose requested start is more than 10 seconds into the source, rendering uses FFmpeg's accurate input seek to ten seconds before that timestamp before it decodes or encodes. Clips starting at 10 seconds or earlier simply begin from the source start. The final filter trims away the ten-second pre-roll and preserves frame-accurate requested boundaries without decoding unrelated earlier footage.
 
 Run the small built-in automated verification with:
@@ -310,7 +343,7 @@ Run the small built-in automated verification with:
 python3 video_cropper.py self-test
 ```
 
-`self-test` is safe to run without an active source video. It checks that both `ffmpeg` and `ffprobe` are installed and runnable, validates timestamp/name/source-discovery rules, checks start/end and start/duration configuration, text defaults and custom timings, preset/hex/random word colors, four-line safe-area limits, both render modes, and the ten-second seek rule. It also creates a tiny temporary video, renders a captioned clip, and verifies its H.264/AAC streams, dimensions, frame rate, BT.709 tags, zero timestamps, duration, and MP4 faststart layout with `ffprobe`. No files in `current_video/` are changed.
+`self-test` is safe to run without an active source video. It checks that both `ffmpeg` and `ffprobe` are installed and runnable, validates timestamp/name/source-discovery rules, checks start/end and start/duration configuration, empty clip lists and no-op rendering, text defaults and custom timings, preset/hex/random word colors, four-line safe-area limits, both render modes, and the ten-second seek rule. Progress checks cover skipped/repeated/invalid timestamps, output received before process exit, large stderr output, independent parallel clips, failure without false completion, cancellation, and publication before 100%. It also creates a tiny temporary video, renders both modes through the live progress reader, and verifies milestones and the completed H.264/AAC streams, dimensions, frame rate, BT.709 tags, zero timestamps, duration, and MP4 faststart layout with `ffprobe`. No files in `current_video/` are changed.
 
 ## Render specification
 
