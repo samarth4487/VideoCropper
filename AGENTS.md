@@ -8,7 +8,7 @@ The active job lives entirely in `current_video/`:
 
 ```text
 current_video/
-├── <exactly one source video: .mp4, .mov, .m4v, or .mkv>
+├── <exactly one source video: .mp4, .mov, .m4v, .mkv, or .webm>
 ├── clips.json
 └── outputs/
 ```
@@ -35,7 +35,7 @@ When the user supplies clip names and time ranges, or says they edited `clips.js
    }
    ```
 
-   Each clip must use `start` plus exactly one of `end` or `duration`. Timestamps may be `HH:MM:SS`, `MM:SS`, with optional milliseconds. Use clear names; output names become safe `<name>.mp4` filenames.
+   Each clip must use `start` plus exactly one of `end` or `duration`. Timestamps may be `HH:MM:SS`, `MM:SS`, with optional milliseconds. Use clear names. Output filenames combine the sanitized clip name with the source's lowercase extension.
 3. Run `python3 video_cropper.py validate`. Resolve every validation error before rendering. In particular, do not silently adjust requested timings or choose a source video for the user.
 4. Run `python3 video_cropper.py dry-run` whenever reviewing the plan is useful, when diagnosing a configuration change, or before the first render of a new workflow. It writes no files.
 5. If the user requested clips to be produced, run `python3 video_cropper.py render`. Use `--jobs N` only when parallel encoding is appropriate for the available machine capacity.
@@ -46,7 +46,7 @@ When the user supplies clip names and time ranges, or says they edited `clips.js
 
 - `render` automatically emits flushed, newline-delimited progress for each clip: a starting line at 0%, then 10%, 20%, through 90%. Each line includes the output filename; parallel jobs track their clips independently.
 - Percentages measure encoded clip time, excluding seek pre-roll, rather than elapsed wall-clock time. Do not estimate progress from output file size or elapsed time when the renderer provides actual milestones.
-- 100% is printed only after FFmpeg succeeds, MP4 finalization finishes, and the completed output is moved into place. A failure or cancellation must not be described as complete.
+- 100% is printed only after FFmpeg succeeds, the container is finalized, and the completed output is moved into place. A failure or cancellation must not be described as complete.
 - When rendering through an assistant, use an execution tool that returns a running session and incremental stdout. Monitor that session at short intervals (about five seconds when supported) and relay every newly received 10% milestone to the user while rendering. If several milestones arrive together, show them together with their filenames; do not discard intermediate milestones or substitute generic updates.
 - The renderer flushes output even through pipes; no `python3 -u` flag is required. If the caller only returns output after process exit, explain that limitation instead of claiming live chat notifications. No external messaging, progress log, or history system is needed.
 
@@ -64,15 +64,16 @@ Text is optional; omit `texts` for a gameplay-only clip. When the user requests 
 
 `video_cropper.py` owns the rendering pipeline. Do not replace it with ad-hoc FFmpeg commands or change its locked render behavior unless the user explicitly asks to change the utility itself.
 
-- 1440×2560 (9:16), 60 fps, SDR BT.709, no HDR/PQ/HLG/tone-mapping.
-- H.264 High, 8-bit `yuv420p`, CRF 18; AAC 48 kHz stereo at 192 kbps; MP4 faststart.
-- Preserve gameplay audio content only, with clip video and audio beginning at timestamp zero.
-- Background: source scale-cover/crop to 1440×2560, Gaussian blur about sigma 40, brightness about -0.18.
-- Foreground: sharp 1440×1920 source scale-cover/center-crop at `x=0, y=320`.
+- Both modes write the source container with its lowercase extension. MP4, MOV, M4V, and MKV use H.264 High at CRF 18 and AAC. WebM uses VP9 at CRF 24 and Opus at 48 kHz.
+- All formats use 8-bit `yuv420p` and audio at 192 kbps. MP4, MOV, and M4V use faststart.
+- Vertical output is 1440×2560 (9:16) at 60 fps with SDR BT.709 and 48 kHz stereo audio. Original mode keeps the source dimensions and nominal frame rate. HDR/PQ/HLG sources are rejected.
+- Preserve gameplay audio content only. Reset the trimmed video and audio timestamps to zero before encoding. Containers may report negative audio timestamps for codec priming.
+- The vertical background uses source scale-cover/crop to 1440×2560, Gaussian blur about sigma 40, and brightness about -0.18.
+- The vertical foreground uses a sharp 1440×1920 source scale-cover/center-crop at `x=0, y=320`.
 
 ## Testing and cleanup
 
-- For a code/configuration check without a source video, run `python3 video_cropper.py self-test`. It verifies FFmpeg/FFprobe availability and runs a temporary end-to-end render; it never changes `current_video/`.
+- For a code/configuration check without a source video, run `python3 video_cropper.py self-test`. It verifies FFmpeg/FFprobe availability and renders both modes in all five supported containers using temporary fixtures. It leaves `current_video/` untouched.
 - `python3 video_cropper.py validate` is the required pre-render check once a source is present.
 - `python3 video_cropper.py clear --yes` is destructive: it removes supported top-level source videos, `clips.json`, and `outputs/`, then recreates `outputs/`. Run it only when the user explicitly asks to reset/clear the active video workspace.
 - Do not delete a user's source, clips, or outputs by any other means.

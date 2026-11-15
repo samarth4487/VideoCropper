@@ -16,7 +16,7 @@ Video Cropper/
     └── outputs/                  # rendered clips for that source only
 ```
 
-Put one `.mp4`, `.mov`, `.m4v`, or `.mkv` directly in `current_video/`. The tool ignores hidden files, non-video files, and everything in `outputs/`. It stops with a clear error if there are zero or multiple top-level source videos—there is never automatic source selection.
+Put one `.mp4`, `.mov`, `.m4v`, `.mkv`, or `.webm` directly in `current_video/`. The tool ignores hidden files, non-video files, and everything in `outputs/`. It stops with a clear error if there are zero or multiple top-level source videos—there is never automatic source selection.
 
 When switching videos, run `python3 video_cropper.py clear --yes`, then put the next video and its new `clips.json` in `current_video/`. `clear` removes only supported top-level source video files, `clips.json`, and `outputs/`; it recreates an empty `outputs/` folder and leaves unrelated files alone.
 
@@ -27,11 +27,11 @@ Each clip has a `mode` field. Video Cropper supports exactly these two values:
 | Mode | When to use it | Result |
 | --- | --- | --- |
 | `vertical` | Vertical social-media clips | The default. It creates the existing 1440×2560, 9:16 blurred-background layout. Optional `texts` overlays are supported. |
-| `original` | A simple landscape source-format cut | It trims only the requested time range. There is no scale, crop, blur, forced frame rate, text, or other visual treatment. |
+| `original` | A simple landscape source-format cut | It trims the requested time range at the source's dimensions and nominal frame rate. |
 
 `mode` belongs inside each clip object. If it is omitted, the clip uses `"vertical"`. Clips in the same `clips` array may use different modes. Any value other than `"vertical"` or `"original"` fails validation.
 
-`original` mode is for the same landscape 16:9 SDR source accepted by this utility. It preserves that source's frame dimensions and nominal frame rate, including 2560×1440 (2K) sources. It still re-encodes the exact range into an iPhone-compatible H.264/AAC MP4 so the clip starts and ends on the requested frames; it is not a keyframe-limited stream copy. `texts` is not allowed in `original` mode, including an empty `texts` array.
+`original` mode is for landscape 16:9 SDR sources. It preserves the frame dimensions and nominal frame rate and re-encodes the exact range in the source container. `texts` is not allowed in `original` mode, including an empty `texts` array.
 
 ## Clip configuration
 
@@ -46,7 +46,7 @@ Edit [`current_video/clips.json`](current_video/clips.json):
 }
 ```
 
-Each clip needs a unique `name`, a `start`, exactly one of `end` or `duration`, and an optional `mode`. Timestamps support `HH:MM:SS`, `MM:SS`, and optional milliseconds. Every range is validated before any render: its end must follow its start and fall within the source duration. Names are converted to safe filenames; collisions after sanitization are rejected. The rendered filename is `<safe-name>.mp4`.
+Each clip needs a unique `name`, a `start`, exactly one of `end` or `duration`, and an optional `mode`. Timestamps support `HH:MM:SS`, `MM:SS`, and optional milliseconds. Validation checks that each end time follows its start and falls within the source duration. Names are converted to safe filenames and collisions after sanitization are rejected. The rendered filename uses the safe name and the source's lowercase extension, such as `01_intro.webm` for WebM input.
 
 To leave the active source in place with no pending clips, use valid JSON with an empty array:
 
@@ -78,7 +78,7 @@ python3 video_cropper.py dry-run
 python3 video_cropper.py render
 ```
 
-`validate` checks the source and configuration. `dry-run` prints the FFmpeg plan without creating files. `render` writes the requested MP4 files to `current_video/outputs/`. The default render is sequential: one clip at a time. Use `python3 video_cropper.py render --jobs 2` or `--jobs 3` only when you want parallel encodes. If an output with the same filename already exists, review it first; use `python3 video_cropper.py render --overwrite` only when you intend to replace it.
+`validate` checks the source and configuration. `dry-run` prints the FFmpeg plan without creating files. `render` writes the requested clips to `current_video/outputs/`, one clip at a time by default. Use `python3 video_cropper.py render --jobs 2` or `--jobs 3` only when you want parallel encodes. If an output with the same filename already exists, review it first and use `python3 video_cropper.py render --overwrite` only when you intend to replace it.
 
 The commands are identical for every example; the JSON in `clips.json` chooses the clip timings, mode, optional text, and text colors.
 
@@ -107,7 +107,7 @@ For any other exact color, use a six-digit hex value in `#RRGGBB` form. For exam
 
 ## Configuration examples
 
-These examples demonstrate both modes, `end` and `duration` ranges, gameplay-only clips, every supported text treatment, and a mixed-mode request.
+These examples demonstrate both modes, `end` and `duration` ranges, gameplay-only clips, every supported text treatment, and a mixed-mode request. The example filenames assume MP4 input.
 
 ### 1. Render a clip with no text
 
@@ -329,7 +329,7 @@ Rendering complete.
 
 Progress comes from FFmpeg's structured `-progress pipe:1` output, sampled approximately once per second. The percentage measures encoded output time divided by the requested clip duration, excluding source footage before the clip and the ten-second seek pre-roll. For a 60-second clip, each six seconds of encoded output crosses another 10% milestone. Encoding speed varies, so these are not equally spaced wall-clock notifications or a prediction of time remaining.
 
-Each milestone is printed once. If one FFmpeg update crosses several milestones, they are printed together in order; very short clips may print most of their milestones together. 100% is reserved until FFmpeg exits successfully, finishes MP4 finalization (including faststart), and the completed file is moved into place. Finalization may therefore leave the display at 90% briefly. Failed or cancelled clips never report 100% or complete. FFmpeg errors are drained concurrently and the last 200 lines (up to 2,000 characters per line) are retained for diagnostics. Ctrl+C stops running encoders and cleans their temporary files; completed outputs are preserved.
+Each milestone is printed once. If one FFmpeg update crosses several milestones, they are printed together in order. Very short clips may print most of their milestones together. 100% is reserved until FFmpeg finalizes the container, exits successfully, and the completed file is moved into place. Finalization may therefore leave the display at 90% briefly. Failed or cancelled clips never report 100% or complete. FFmpeg errors are drained concurrently and the last 200 lines (up to 2,000 characters per line) are retained for diagnostics. Ctrl+C stops running encoders, removes their temporary files, and preserves completed outputs.
 
 With `--jobs N`, each clip has independent progress. Lines from different clips may alternate, and every line includes its filename. Complete lines are synchronized and immediately flushed to stdout, including when stdout is a pipe rather than a terminal.
 
@@ -343,16 +343,26 @@ Run the small built-in automated verification with:
 python3 video_cropper.py self-test
 ```
 
-`self-test` is safe to run without an active source video. It checks that both `ffmpeg` and `ffprobe` are installed and runnable, validates timestamp/name/source-discovery rules, checks start/end and start/duration configuration, empty clip lists and no-op rendering, text defaults and custom timings, preset/hex/random word colors, four-line safe-area limits, both render modes, and the ten-second seek rule. Progress checks cover skipped/repeated/invalid timestamps, output received before process exit, large stderr output, independent parallel clips, failure without false completion, cancellation, and publication before 100%. It also creates a tiny temporary video, renders both modes through the live progress reader, and verifies milestones and the completed H.264/AAC streams, dimensions, frame rate, BT.709 tags, zero timestamps, duration, and MP4 faststart layout with `ffprobe`. No files in `current_video/` are changed.
+`self-test` is safe to run without an active source video. It checks that `ffmpeg` and `ffprobe` are runnable, validates configuration and source discovery, and exercises text overlays, accurate seeking, live progress, cancellation, and cleanup. It renders both modes from temporary sources in all five containers and checks dry-run filenames, overwrite protection, codecs, dimensions, frame rates, audio settings, and faststart where applicable. The full suite requires FFmpeg with `libx264`, `libvpx-vp9`, `libopus`, and the `subtitles` filter. No files in `current_video/` are changed.
 
 ## Render specification
 
-Every output is rendered (never stream-copied) with frame-accurate video and audio trimming starting at timestamp zero. Both modes create an MP4 with H.264 High video at CRF 18 in 8-bit `yuv420p`, AAC audio at 192 kbps, and `faststart` enabled. Source gameplay audio is only trimmed and re-encoded as required—no narration, music, effects, muting, gain changes, or mixing.
+Both modes re-encode the requested range with frame-accurate trimming and write the source container.
+
+| Source extension | Output extension | Video | Audio |
+| --- | --- | --- | --- |
+| `.mp4` | `.mp4` | H.264 High, CRF 18 | AAC |
+| `.mov` | `.mov` | H.264 High, CRF 18 | AAC |
+| `.m4v` | `.m4v` | H.264 High, CRF 18 | AAC |
+| `.mkv` | `.mkv` | H.264 High, CRF 18 | AAC |
+| `.webm` | `.webm` | VP9, CRF 24 | Opus |
+
+All outputs use 8-bit `yuv420p` and audio at 192 kbps. MP4, MOV, and M4V use faststart. WebM rendering requires an FFmpeg build with `libvpx-vp9` and `libopus`. WebM and MKV may report a negative audio start timestamp for encoder priming.
 
 ### `vertical` output
 
-The default `vertical` mode is exactly 1440×2560 at 60 fps, with AAC 48 kHz stereo audio and SDR BT.709 metadata. Its layout is a 1440×2560 scale-cover, center-cropped background with Gaussian blur (`sigma=40`) and brightness `-0.18`, plus a sharp 1440×1920 scale-cover, center-cropped gameplay frame at `x=0, y=320`. There are no overlays other than the optional user-configured text described above.
+The default `vertical` mode is exactly 1440×2560 at 60 fps, with 48 kHz stereo audio and SDR BT.709 metadata. Its layout is a 1440×2560 scale-cover, center-cropped background with Gaussian blur (`sigma=40`) and brightness `-0.18`, plus a sharp 1440×1920 scale-cover, center-cropped gameplay frame at `x=0, y=320`. There are no overlays other than the optional user-configured text described above.
 
 ### `original` output
 
-`original` mode preserves the source's 16:9 frame dimensions and nominal frame rate; for example, 1920×1080 at 59.94 fps remains 1920×1080 at 59.94 fps, and 2560×1440 at 60 fps remains 2560×1440 at 60 fps. It does not scale, crop, blur, or add text. It explicitly declares that source rate to the H.264 encoder so it produces a level appropriate for the clip rather than an unnecessarily high level that iPhone Photos can reject. Its AAC output keeps the source audio's sample rate and channel count. HDR-tagged sources are rejected because this utility does not tone-map HDR.
+`original` mode preserves the source's 16:9 frame dimensions and writes a constant frame rate at the source's nominal rate. For example, 1920×1080 at 59.94 fps remains 1920×1080 at 59.94 fps. It declares the nominal rate to the H.264 encoder to keep the advertised level appropriate for the clip. AAC output keeps the source audio's sample rate and channel count. WebM keeps the channel count and encodes Opus at 48 kHz. HDR-tagged sources are rejected.

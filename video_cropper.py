@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent
 CURRENT_VIDEO = ROOT / "current_video"
 CONFIG_FILE = CURRENT_VIDEO / "clips.json"
 OUTPUTS = CURRENT_VIDEO / "outputs"
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv"}
+VIDEO_MUXERS = {".mp4": "mp4", ".mov": "mov", ".m4v": "ipod", ".mkv": "matroska", ".webm": "webm"}
 NAME_MAX_LENGTH = 120
 COLOR_PRESETS = {"white": "#FFFFFF", "red": "#FF3B30", "green": "#34C759", "yellow": "#FFD60A"}
 TEXT_FONT = "Impact"
@@ -75,10 +75,15 @@ class Clip:
     end: Decimal
     texts: tuple["TextOverlay", ...] = ()
     mode: str = DEFAULT_MODE
+    output_extension: str = ".mp4"
 
     @property
     def filename(self) -> str:
-        return f"{self.name}.mp4"
+        return f"{self.name}{self.output_extension}"
+
+    @property
+    def partial_filename(self) -> str:
+        return f".{self.name}.partial{self.output_extension}"
 
     @property
     def duration(self) -> Decimal:
@@ -113,14 +118,14 @@ def discover_source(directory: Path = CURRENT_VIDEO) -> Path:
             for item in directory.iterdir()
             if item.is_file()
             and not item.name.startswith(".")
-            and item.suffix.lower() in VIDEO_EXTENSIONS
+            and item.suffix.lower() in VIDEO_MUXERS
         ),
         key=lambda item: item.name.casefold(),
     )
     if not videos:
         raise CropperError(
             f"No source video found in {directory}. Place exactly one MP4, MOV, M4V, "
-            "or MKV file directly in current_video/. Files inside outputs/ are ignored."
+            "MKV, or WebM file directly in current_video/. Files inside outputs/ are ignored."
         )
     if len(videos) > 1:
         names = ", ".join(item.name for item in videos)
@@ -352,7 +357,7 @@ def load_texts(value: Any, clip_duration: Decimal, clip_index: int) -> tuple[Tex
     return tuple(overlays)
 
 
-def load_clips(config_path: Path, source_duration: Decimal) -> list[Clip]:
+def load_clips(config_path: Path, source_duration: Decimal, output_extension: str = ".mp4") -> list[Clip]:
     if not config_path.is_file():
         raise CropperError(f"Missing clipping configuration: {config_path}")
     try:
@@ -372,7 +377,7 @@ def load_clips(config_path: Path, source_duration: Decimal) -> list[Clip]:
         if name.casefold() in seen:
             raise CropperError(
                 f"clips[{index}] name {entry.get('name')!r} collides after filename "
-                f"sanitization (output: {name}.mp4)."
+                f"sanitization (output: {name}{output_extension})."
             )
         seen.add(name.casefold())
         prefix = f"clips[{index}]"
@@ -383,7 +388,8 @@ def load_clips(config_path: Path, source_duration: Decimal) -> list[Clip]:
                 f"{prefix}.texts is not supported when mode is '{ORIGINAL_MODE}'; "
                 "that mode makes an unadorned source-format clip."
             )
-        clips.append(Clip(name, start, end, load_texts(entry.get("texts"), end - start, index), mode))
+        texts = load_texts(entry.get("texts"), end - start, index)
+        clips.append(Clip(name, start, end, texts, mode, output_extension))
     return clips
 
 
@@ -511,6 +517,15 @@ def ffmpeg_filter(
 
 def build_ffmpeg_command(source: SourceInfo, clip: Clip, destination: Path, subtitle_path: Path | None = None) -> list[str]:
     input_seek = should_seek_input(clip)
+    muxer = VIDEO_MUXERS[clip.output_extension]
+    frame_rate = "60"
+    color_space = color_primaries = color_transfer = "bt709"
+    if clip.mode == ORIGINAL_MODE:
+        frame_rate = source.frame_rate
+        color_space = source.color_space or "bt709"
+        color_primaries = source.color_primaries or "bt709"
+        color_transfer = source.color_transfer or "bt709"
+
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-nostdin", "-nostats", "-progress", "pipe:1", "-stats_period", "1",
@@ -519,45 +534,53 @@ def build_ffmpeg_command(source: SourceInfo, clip: Clip, destination: Path, subt
         # Input seeking is accurate for re-encoding: FFmpeg seeks to a nearby
         # keyframe then decodes/discards frames until the pre-roll timestamp.
         command.extend(["-ss", format(input_seek_start(clip), "f"), "-accurate_seek"])
-    command.extend([
-        "-i", str(source.path), "-filter_complex", ffmpeg_filter(clip, subtitle_path, input_seek=input_seek),
-        "-map", "[v]", "-map", "[a]",
-    ])
-    if clip.mode == ORIGINAL_MODE:
-        # Filtering provides frame-accurate start and end boundaries while leaving
-        # the source frame size intact. FFmpeg otherwise passes the filter's fine
-        # time base to x264, which can make a normal 1080p60 clip advertise an
-        # unnecessarily high H.264 level that Photos rejects. Declare the source's
-        # nominal rate explicitly so the output is CFR at that same rate.
+    filters = ffmpeg_filter(clip, subtitle_path, input_seek=input_seek)
+    video = "[v]"
+    if muxer == "webm":
+        # Set color metadata on the frames so the muxer can write the WebM color fields.
+        video = "[tagged]"
+        filters += (
+            f";[v]setparams=range=tv:color_primaries={color_primaries}:"
+            f"color_trc={color_transfer}:colorspace={color_space}{video}"
+        )
+    command.extend(["-i", str(source.path), "-filter_complex", filters, "-map", video, "-map", "[a]"])
+
+    if muxer == "webm":
         command.extend([
-            "-c:v", "libx264", "-profile:v", "high", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-r", source.frame_rate, "-fps_mode", "cfr",
-            "-colorspace", source.color_space or "bt709",
-            "-color_primaries", source.color_primaries or "bt709",
-            "-color_trc", source.color_transfer or "bt709",
-            "-color_range", "tv",
-            "-x264-params", (
-                f"colorprim={source.color_primaries or 'bt709'}:"
-                f"transfer={source.color_transfer or 'bt709'}:"
-                f"colormatrix={source.color_space or 'bt709'}"
-            ),
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination),
+            "-c:v", "libvpx-vp9", "-crf", "24", "-b:v", "0", "-cpu-used", "3", "-row-mt", "1",
+            "-c:a", "libopus",
         ])
     else:
         command.extend([
-            "-c:v", "libx264", "-profile:v", "high", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-r", "60", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-            "-color_range", "tv", "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-            "-movflags", "+faststart", "-map_metadata", "-1", str(destination),
+            "-c:v", "libx264", "-profile:v", "high", "-crf", "18",
+            "-x264-params", (
+                f"colorprim={color_primaries}:transfer={color_transfer}:colormatrix={color_space}"
+            ),
+            "-c:a", "aac",
         ])
+    command.extend([
+        "-pix_fmt", "yuv420p", "-r", frame_rate,
+        "-colorspace", color_space, "-color_primaries", color_primaries,
+        "-color_trc", color_transfer, "-color_range", "tv", "-b:a", "192k",
+    ])
+    if clip.mode == ORIGINAL_MODE:
+        # Declaring the nominal rate keeps x264 from using the filter time base
+        # to choose an unnecessarily high H.264 level.
+        command.extend(["-fps_mode", "cfr"])
+    else:
+        command.extend(["-ac", "2", "-map_metadata", "-1"])
+    if clip.mode == DEFAULT_MODE or muxer == "webm":
+        command.extend(["-ar", "48000"])
+    if muxer in {"mp4", "mov", "ipod"}:
+        command.extend(["-movflags", "+faststart"])
+    command.extend(["-f", muxer, str(destination)])
     return command
 
 
 def validate_project() -> tuple[SourceInfo, list[Clip]]:
     require_binaries()
-    source = run_ffprobe(discover_source())
-    clips = load_clips(CONFIG_FILE, source.duration)
+    source = run_ffprobe(discover_source(CURRENT_VIDEO))
+    clips = load_clips(CONFIG_FILE, source.duration, source.path.suffix.lower())
     return source, clips
 
 
@@ -591,7 +614,7 @@ class RenderProgress:
             return
         total_us = self.clip.duration * 1_000_000
         # Catch up crossed milestones, ignore repeats/regressions, and reserve
-        # 100% for a successful exit and publication of the completed MP4.
+        # 100% for a successful exit and publication of the completed file.
         while self.next_percent <= 90 and encoded_us * 100 >= total_us * self.next_percent:
             print_status(f"[{self.clip.filename}] {self.next_percent}%")
             self.next_percent += 10
@@ -676,7 +699,7 @@ def render_one(
     destination = OUTPUTS / clip.filename
     if destination.exists() and not overwrite:
         raise CropperError(f"Refusing to overwrite existing output: {destination}. Use --overwrite.")
-    temporary = OUTPUTS / f".{clip.name}.partial.mp4"
+    temporary = OUTPUTS / clip.partial_filename
     subtitles = CURRENT_VIDEO / f".{clip.name}.text.ass"
     if temporary.exists() or temporary.is_symlink():
         temporary.unlink()
@@ -725,7 +748,7 @@ def command_dry_run(_: argparse.Namespace) -> int:
         return 0
     print("\nFFmpeg commands (no files will be created):")
     for clip in clips:
-        temporary = OUTPUTS / f".{clip.name}.partial.mp4"
+        temporary = OUTPUTS / clip.partial_filename
         subtitles = CURRENT_VIDEO / f".{clip.name}.text.ass"
         print("  " + shlex_join(build_ffmpeg_command(source, clip, temporary, subtitles if clip.texts else None)))
     return 0
@@ -788,7 +811,7 @@ def command_clear(args: argparse.Namespace) -> int:
                 shutil.rmtree(item)
             removed.append("outputs/")
         elif item == CONFIG_FILE or (
-            item.is_file() and not item.name.startswith(".") and item.suffix.lower() in VIDEO_EXTENSIONS
+            item.is_file() and not item.name.startswith(".") and item.suffix.lower() in VIDEO_MUXERS
         ):
             item.unlink()
             removed.append(item.name)
@@ -860,8 +883,8 @@ class CropperUnitTests(unittest.TestCase):
                 '{"clips":[{"name":"jump replay","start":"00:00","end":"00:01"},'
                 '{"name":"jump_replay","start":"00:01","end":"00:02"}]}', encoding="utf-8"
             )
-            with self.assertRaises(CropperError):
-                load_clips(config, Decimal("3"))
+            with self.assertRaisesRegex(CropperError, r"output: jump_replay\.webm"):
+                load_clips(config, Decimal("3"), ".webm")
 
     def test_duration_and_default_text_lifetime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -898,6 +921,11 @@ class CropperUnitTests(unittest.TestCase):
             (folder / "notes.txt").touch()
             (folder / "gameplay.MOV").touch()
             self.assertEqual(discover_source(folder).name, "gameplay.MOV")
+            (folder / "gameplay.WEBM").touch()
+            with self.assertRaisesRegex(CropperError, "Found 2 top-level source videos"):
+                discover_source(folder)
+            (folder / "gameplay.MOV").unlink()
+            self.assertEqual(discover_source(folder).name, "gameplay.WEBM")
 
     def test_filter_has_locked_layout(self) -> None:
         filter_graph = ffmpeg_filter(Clip("example", Decimal("10"), Decimal("20")))
@@ -1159,6 +1187,88 @@ class CropperRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(executable, result.stdout.lower())
+
+    def test_render_matches_each_source_container(self) -> None:
+        formats = (
+            (".mp4", "mp4", "isom"),
+            (".mov", "mov", "qt"),
+            (".m4v", "ipod", "M4V"),
+            (".mkv", "matroska", None),
+            (".webm", "webm", None),
+        )
+        with tempfile.TemporaryDirectory(prefix="video-cropper-self-test-") as temp:
+            for extension, muxer, brand in formats:
+                with self.subTest(extension=extension):
+                    folder = Path(temp) / muxer
+                    folder.mkdir()
+                    source = folder / f"source{extension.upper()}"
+                    config = folder / "clips.json"
+                    outputs = folder / "outputs"
+                    webm = extension == ".webm"
+                    video_encoder, audio_encoder = ("libvpx-vp9", "libopus") if webm else ("libx264", "aac")
+                    sample_rate = "48000" if webm else "44100"
+                    generated = subprocess.run(
+                        [
+                            "ffmpeg", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+                            "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate={sample_rate}",
+                            "-t", "0.4", "-c:v", video_encoder, "-c:a", audio_encoder,
+                            "-f", muxer, str(source),
+                        ],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(generated.returncode, 0, generated.stderr)
+                    dimensions = {"original": (160, 90), "vertical": (1440, 2560)}
+                    config.write_text(json.dumps({"clips": [
+                        {"name": mode, "start": "00:00.100", "end": "00:00.300", "mode": mode}
+                        for mode in dimensions
+                    ]}), encoding="utf-8")
+                    output = io.StringIO()
+                    with patch.multiple(sys.modules[__name__], CURRENT_VIDEO=folder, CONFIG_FILE=config, OUTPUTS=outputs), \
+                            contextlib.redirect_stdout(output):
+                        args = argparse.Namespace(jobs=1, overwrite=False)
+                        self.assertEqual(command_dry_run(args), 0)
+                        for mode in dimensions:
+                            self.assertIn(f".{mode}.partial{extension}", output.getvalue())
+                        self.assertFalse(outputs.exists())
+                        self.assertEqual(command_render(args), 0)
+                        with self.assertRaisesRegex(CropperError, re.escape(f"original{extension}, vertical{extension}")):
+                            command_render(args)
+
+                    self.assertEqual({path.name for path in outputs.iterdir()}, {f"{mode}{extension}" for mode in dimensions})
+                    for mode, size in dimensions.items():
+                        filename = f"{mode}{extension}"
+                        self.assertIn(f"[{filename}] 100% — complete", output.getvalue())
+                        destination = outputs / filename
+                        inspected = subprocess.run(
+                            [
+                                "ffprobe", "-v", "error", "-show_entries",
+                                "format=duration:format_tags=major_brand:stream=codec_type,codec_name,width,height,"
+                                "r_frame_rate,pix_fmt,color_space,color_transfer,color_primaries,sample_rate,channels",
+                                "-of", "json", str(destination),
+                            ],
+                            text=True, capture_output=True, check=False,
+                        )
+                        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+                        payload = json.loads(inspected.stdout)
+                        streams = {stream["codec_type"]: stream for stream in payload["streams"]}
+                        video, audio = streams["video"], streams["audio"]
+                        self.assertEqual((video["codec_name"], audio["codec_name"]), ("vp9", "opus") if webm else ("h264", "aac"))
+                        self.assertEqual((video["width"], video["height"]), size)
+                        self.assertEqual(video["pix_fmt"], "yuv420p")
+                        vertical = mode == DEFAULT_MODE
+                        self.assertEqual(video["r_frame_rate"], "60/1" if vertical else "30/1")
+                        self.assertEqual((audio["sample_rate"], audio["channels"]), ("48000", 2) if vertical else (sample_rate, 1))
+                        self.assertEqual((video["color_space"], video["color_transfer"], video["color_primaries"]), ("bt709", "bt709", "bt709"))
+                        self.assertAlmostEqual(float(payload["format"]["duration"]), 0.2, delta=0.03)
+                        if brand:
+                            self.assertEqual(payload["format"]["tags"]["major_brand"].strip(), brand)
+                            data = destination.read_bytes()
+                            self.assertLess(data.index(b"moov"), data.index(b"mdat"))
+                        else:
+                            with destination.open("rb") as container:
+                                header = container.read(64)
+                            self.assertIn(muxer.encode("ascii"), header)
 
     def test_end_to_end_render_with_text_and_audio(self) -> None:
         """Render a tiny disposable source and inspect the completed MP4."""
